@@ -187,7 +187,12 @@ inline Ports parse(const void *data,size_t length,Family family) {
         if(!(type&2))continue;
         const auto d=ddi(family,c[16]);
         if(d==PortCount){++r.unmapped;continue;}
-        if(r.present&(1U<<d)){r.status=Status::Conflict;return r;}
+        // Some laptop VBTs list two children on one DDI (e.g. a DP and an HDMI
+        // entry for the same DVO 8 port on Dell G15 5530, RPL-HX); rejecting
+        // the whole table left the panel without routes. Like i915, keep the
+        // first child and record the DDI as ambiguous. Do not count it as
+        // unmapped: the PPS0 panel check rejects any unmapped child.
+        if(r.present&(1U<<d)){r.ambiguous|=1U<<d;continue;}
         auto &q=r.port[d];q.type=type;q.dvo=c[16];q.ddc=c[19];q.aux=c[25];q.flags=c[23];q.capabilities=c[33];q.hdmiPreset=c[7]&31;
         r.present|=1U<<d;
         if(!q.fixedTMDS())r.ambiguous|=1U<<d;
