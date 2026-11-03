@@ -13163,6 +13163,22 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
      adlsPowerReady=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
     }
     IORegistryEntry::getRegistryRoot()->setProperty("ADLSLanePowerReady",adlsPowerReady);
+    // RPL-HX laptop GOP (Dell G15 5530) leaves CDCLK at 172.8 MHz (decimal 0x158).
+    // The donor probeCDClockFrequency accepts only 307.2/312/552/556.8/648/652.8
+    // MHz and otherwise returns 0 ("Wrong CD clock frequency 0x0 set by EFI"):
+    // the modeset completes but the panel stays black. As WhateverGreen's ICL
+    // CDCLK fix: disable CDCLK and program the PLL for 652.8 MHz before the probe.
+    {
+     adlsDisableCDClock=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController14disableCDClockEv",address,size);
+     adlsSetCDClock=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController19setCDClockFrequencyEy",address,size);
+     patcher.clearError();
+     bool cdReady=adlsDisableCDClock && adlsSetCDClock && orgTGLRegisterRead;
+     if(cdReady) {
+      KernelPatcher::RouteRequest route("__ZN31AppleIntelFramebufferController21probeCDClockFrequencyEv",wrapADLSCDClockProbe,orgADLSCDClockProbe);
+      cdReady=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+     }
+     IORegistryEntry::getRegistryRoot()->setProperty("ADLSCDClockSanitizeReady",cdReady);
+    }
     // Native startup remains closed if any required ADL-S adapter is absent.
     const auto contract=XELP::DisplayContract::adls(display12Available(),adlsWiring.dp!=0,adlsWiring.panel!=0);
     adlsDisplayHooksReady=contract.ready();
@@ -13518,6 +13534,14 @@ uint32_t XE::wrapTGLPanelTiming(void *controller) {
 
 // ADL-S native PWM panel adapter. The panel lifecycle remains synchronous
 // and donor-owned; only its period, polarity and duty arithmetic are replaced.
+// When the adapter declines the panel (on Dell G15 5530 the 0x42000 bit 24
+// check fails, so every request returned NotReady and brightness stayed at the
+// firmware level), the request falls back to the donor path with the
+// WhateverGreen BacklightRegistersFix rule in wrapTGLRegisterWrite: keep the
+// hardware period in 0xC8254 and rescale the 0xC8258 duty from the donor
+// period (or -wex-blmax, default 17777, when the donor never writes one) to the
+// hardware period, with an optional floor -wex-blmin (hardware PWM units).
+static uint32_t adlsBlHw=0,adlsBlDonor=0;
 bool XE::adlsPanelPWMTarget(void *controller,void *&access,void *&power) {
  auto s=callbackXE;auto c=static_cast<uint8_t *>(controller);access=power=nullptr;
  if(!s->adlsDisplaySelected || XELP::displayAdapter(s->xeProfile.family)!=XELP::DisplayAdapter::ADLS || !s->adlsPanelPWMReady || !s->tglActive || !c || c!=s->tglObservationController ||
@@ -13564,14 +13588,17 @@ uint32_t XE::wrapADLSPanelBacklight(void *controller,uint32_t brightness) {
  if(!s->adlsDisplaySelected || !s->adlsWiring.panel)
   return FunctionCast(wrapADLSPanelBacklight,s->orgADLSPanelBacklight)(controller,brightness);
  void *access,*power;uint32_t duty;
- if(!adlsCapturePanelPWM(controller) || !adlsPanelPWMTarget(controller,access,power) ||
-    !s->adlsPanelPWM.duty(brightness,duty))return kIOReturnNotReady;
+ if(!adlsCapturePanelPWM(controller) || !adlsPanelPWMTarget(controller,access,power)) {
+  if(!XELP::panelPWMDonorFallback){XELP::panelPWMDonorFallback=true;IORegistryEntry::getRegistryRoot()->setProperty("ADLSBacklightDonorFallback",true);}
+  return FunctionCast(wrapADLSPanelBacklight,s->orgADLSPanelBacklight)(controller,brightness);
+ }
+ if(!s->adlsPanelPWM.duty(brightness,duty))return kIOReturnNotReady;
  auto &f=s->tglTCNativeFunctions;f.getPG(power,1);
  const auto wells=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,0x45404);
  const auto fuse=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,0x42000);
  const bool ready=wells!=~0U && fuse!=~0U && (wells&1) && (fuse&0x01000000);
  if(ready) {
-  wrapTGLRegisterWrite(access,0xC8258,duty);
+  XELP::panelPWMBypass=true;wrapTGLRegisterWrite(access,0xC8258,duty);XELP::panelPWMBypass=false;
   *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE58)=brightness;
  }
  f.putPG(power,1);return ready?0:kIOReturnNotReady;
@@ -18690,6 +18717,23 @@ void XE::wrapTGLComboEnableClocks(void *controller,void *port,void *other,uint32
     FunctionCast(wrapTGLComboEnableClocks,callbackXE->orgComboEnableClocks)(controller,port,other,params);
 }
 
+uint64_t XE::wrapADLSCDClockProbe(void *controller) {
+    auto access=*reinterpret_cast<void **>(static_cast<uint8_t *>(controller)+0xC40);
+    const uint32_t decimal=wrapTGLRegisterRead(access,0x46000)&0x7FF,ref=wrapTGLRegisterRead(access,0x51004)>>29;
+    static const uint32_t known[]={0x264,0x26E,0x44E,0x458,0x50E,0x518};
+    bool supported=false;for(auto v:known)supported|=decimal==v;
+    // DSSM reference 0=19.2, 1=24, 2=38.4 MHz; PLL ratios as WhateverGreen ICL_CDCLK_PLL_FREQ_REF_*.
+    static const uint64_t pll[]={19200000ULL*68,24000000ULL*54,38400000ULL*34};
+    uint32_t record[]={decimal,ref,supported,0};
+    if(!supported && ref<3) {
+        FunctionCast(wrapADLSCDClockProbe,callbackXE->adlsDisableCDClock)(controller);
+        reinterpret_cast<void (*)(void *,uint64_t)>(callbackXE->adlsSetCDClock)(controller,pll[ref]);
+        record[3]=wrapTGLRegisterRead(access,0x46000)&0x7FF;
+    }
+    IORegistryEntry::getRegistryRoot()->setProperty("ADLSCDClockSanitize",record,sizeof(record));
+    return FunctionCast(wrapADLSCDClockProbe,callbackXE->orgADLSCDClockProbe)(controller);
+}
+
 void XE::wrapADLSEnableClocks(void *controller,void *port,void *otherPort,uint32_t *params) {
     AlderLakeS::HDMIClock encoded;
     if(!adlsClockTarget(controller,port,otherPort) ||
@@ -18986,6 +19030,27 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
 		}
 	}
     comboClockTranslateWrite(access,reg,value,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    if (XELP::panelPWMDonorFallback && !XELP::panelPWMBypass && callbackXE->adlsDisplaySelected && (reg == 0xC8254 || reg == 0xC8258) &&
+        callbackXE->orgTGLRegisterRead) {
+        static uint32_t blmax = 0, blmin = 0;
+        if (!blmax) {
+            if (!PE_parse_boot_argn("-wex-blmax", &blmax, sizeof(blmax)) || !blmax) blmax = 17777;
+            if (!PE_parse_boot_argn("-wex-blmin", &blmin, sizeof(blmin))) blmin = 0;
+        }
+        if (!adlsBlHw) adlsBlHw = FunctionCast(wrapTGLRegisterRead, callbackXE->orgTGLRegisterRead)(access, 0xC8254);
+        const bool hwOK = adlsBlHw && adlsBlHw != ~0U;
+        if (reg == 0xC8254) {
+            if (value) adlsBlDonor = value;
+            if (hwOK) value = adlsBlHw;
+        } else {
+            const uint32_t ref = adlsBlDonor ? adlsBlDonor : blmax;
+            if (hwOK && ref && ref != adlsBlHw) {
+                const uint32_t lo = blmin < adlsBlHw ? blmin : 0;
+                const uint64_t v = lo + uint64_t(value) * (adlsBlHw - lo) / ref;
+                value = v > adlsBlHw ? adlsBlHw : uint32_t(v);
+            }
+        }
+    }
 	auto &tx = tglClockOffTransaction;
 	if (callbackXE->tglClockOffCaller && reinterpret_cast<uintptr_t>(__builtin_return_address(0)) == callbackXE->tglClockOffCaller &&
 		reg == tx.clockReg && !(value & 0xF0000000U) &&

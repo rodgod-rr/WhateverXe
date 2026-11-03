@@ -4,6 +4,9 @@
 #define KERN_XELP_PANEL_PWM_HPP
 #include <stdint.h>
 namespace XELP {
+// Donor-path brightness fallback (see XE::wrapADLSPanelBacklight): set once the
+// PWM adapter declines the panel; Bypass marks the adapter's own duty write.
+inline bool panelPWMDonorFallback=false,panelPWMBypass=false;
 struct PanelPWM {
  uint32_t period {},polarity {};
  bool valid() const {return period && period!=~0U;}

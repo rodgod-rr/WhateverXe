@@ -115,6 +115,9 @@ private:
  static uint32_t wrapADLSPanelBacklight(void *controller,uint32_t brightness);
  static void wrapADLSPanelPWMEnable(void *access);
     mach_vm_address_t orgADLSPowerPG {};
+    // ADL-S/HX laptops: firmware CDCLK outside the donor probe table.
+    mach_vm_address_t orgADLSCDClockProbe {}, adlsDisableCDClock {}, adlsSetCDClock {};
+    static uint64_t wrapADLSCDClockProbe(void *controller);
     static uint8_t *adlsPowerTarget(void *power);
     static void wrapADLSPowerPG(void *power,bool enable,uint32_t requested);
     mach_vm_address_t orgComboEnableClocks {};
