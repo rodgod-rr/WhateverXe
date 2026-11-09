@@ -81,6 +81,11 @@ inline Event classify(uint64_t raw) {
 		} else if (!(event.away == event.to)) {
 			if (!event.detail) event.kind = Kind::ElementComplete;
 			else if (event.detail <= 4) event.kind = Kind::ElementWait;
+		} else if (!event.detail) {
+			// Same context in both ELSP elements: element 0 completed and the
+			// hardware continued with element 1. Without "switched to new
+			// queue" this is a completion, not a lite restore.
+			event.kind = Kind::ElementComplete;
 		}
 	}
 	return event;
@@ -98,14 +103,14 @@ inline LegacyEntry legacyEntry(const Event &event) {
 	const bool sameSubmission = event.away == event.to;
 	uint32_t flags = !awayValid && toValid ? 1 : 0;
 	if (event.detail == 5 || (awayValid && event.newQueue)) flags |= 2;
-	if (awayValid && toValid && !sameSubmission && !event.newQueue) flags |= 4;
+	if (awayValid && toValid && !event.newQueue) flags |= 4;
 	if (awayValid && !toValid && !event.newQueue) flags |= 8;
 	if (awayValid && !event.detail) flags |= 0x10;
 	if (event.detail == 1) flags |= 0x20;
 	if (event.detail == 2) flags |= 0x40;
 	if (event.detail == 3) flags |= 0x100;
 	if (event.detail == 4) flags |= 0x80;
-	if (awayValid && sameSubmission) flags |= 0x8000;
+	if (awayValid && sameSubmission && event.newQueue) flags |= 0x8000;
 	flags |= (lo & 4) << 9;
 	const uint32_t identity = ((lo & 0xF8) << 26) | ((lo << 10) & 0x3F0000)
 		| ((hi >> 3) & 0x1F800000) | ((hi >> 10) & 0xFFE0) | ((hi >> 12) & 7);

@@ -187,7 +187,9 @@ inline Ports parse(const void *data,size_t length,Family family) {
         if(!(type&2))continue;
         const auto d=ddi(family,c[16]);
         if(d==PortCount){++r.unmapped;continue;}
-        if(r.present&(1U<<d)){r.status=Status::Conflict;return r;}
+        // G15 (03/11): a VBT do Dell G15 5530 (Hybrid) tem 2 entradas no DVO 8 (DP/HDMI e HDMI, DDC diferentes).
+        // O i915 so avisa e fica com a 1a; aqui tambem, marcando a porta como ambigua (nunca HDMI fixa).
+        if(r.present&(1U<<d)){r.ambiguous|=1U<<d;continue;}  // sem ++unmapped: o nativePPS0 recusa o painel se houver unmapped
         auto &q=r.port[d];q.type=type;q.dvo=c[16];q.ddc=c[19];q.aux=c[25];q.flags=c[23];q.capabilities=c[33];q.hdmiPreset=c[7]&31;
         r.present|=1U<<d;
         if(!q.fixedTMDS())r.ambiguous|=1U<<d;

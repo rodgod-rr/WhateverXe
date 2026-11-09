@@ -126,6 +126,12 @@ private:
  static uint32_t wrapADLSPanelBacklight(void *controller,uint32_t brightness);
  static void wrapADLSPanelPWMEnable(void *access);
     mach_vm_address_t orgADLSPowerPG {};
+    // G15 (03/11): CDCLK do GOP do RPL-S/HX (172,8 MHz) fora da tabela do probe da Apple; ver wrapADLSCDClockProbe.
+    mach_vm_address_t orgADLSCDClockProbe {}, adlsDisableCDClock {}, adlsSetCDClock {};
+    static uint64_t wrapADLSCDClockProbe(void *controller);
+    // G15 (09/11): painel desligado no despertar via Doze -> Wake (o LightUpEDP nao e chamado); ver wrapADLSSetMode.
+    mach_vm_address_t orgADLSSetMode {}, adlsPanelPowerFn {};
+    static uint32_t wrapADLSSetMode(void *controller,void *fb,void *path,const void *timing);
     static uint8_t *adlsPowerTarget(void *power);
     static void wrapADLSPowerPG(void *power,bool enable,uint32_t requested);
     mach_vm_address_t orgComboEnableClocks {};

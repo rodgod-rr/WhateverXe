@@ -11,6 +11,7 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_iokit.hpp>
 #include <IOKit/pci/IOPCIDevice.h>
+void g15KbdWakeInit(); // kern_g15_kbdwake.cpp: o teclado acorda o Deep Idle
 static size_t hostInstructionSize(const uint8_t *bytes,size_t length) {
  uint8_t code[32] {};memcpy(code,bytes,length<sizeof(code)?length:sizeof(code));
  Disassembler::hde_t ins {};
@@ -46,6 +47,7 @@ void XeHost::init() {
  lilu.onKextLoadForce(&surface);
  xe.init();
  XeDataAccess::init();
+ g15KbdWakeInit();
 }
 void XeHost::processKernel(KernelPatcher &patcher) {
  auto info=DeviceInfo::create();if(!info)return;

@@ -13,6 +13,7 @@
 #include "kern_dsi_native_backing.hpp"
 #include "kern_dsi_native_mode.hpp"
 #include "kern_xe.hpp"
+#include "kern_rpls_memory.hpp"
 #include "kern_framebuffer_donor.hpp"
 #include "kern_xelp_os.hpp"
 #include "kern_xelp_call_target.hpp"
@@ -3860,6 +3861,10 @@ extern "C" __attribute__((naked, used)) void tglGuCDMAWriteBridge() {
 		"jmpq *_tglGuCDMAWriteResume(%rip)\n");
 }
 
+// RPLS_MEMORY_IMPLEMENTATION_BEGIN
+#include "kern_rpls_memory.inc.hpp"
+// RPLS_MEMORY_IMPLEMENTATION_END
+
 void XE::init() {
     callbackXE = this;
     // Register notifications before Lilu closes registration. Actual family
@@ -3872,6 +3877,14 @@ void XE::init() {
 void XE::selectProfile(const XELP::Profile &profile) {
     xeProfile=profile;
     tglGT2Detected=profile.admitted() && !profile.overridden() && XELP::tigerLakeGT2Device(profile.identity);
+    // RPLS_MEMORY_PROFILE_BEGIN
+    rplsMemoryAdmitted=RPLSMemory::admitted(profile.identity,profile.revision,
+        profile.admitted() && !profile.overridden() &&
+        XELP::displayAdapter(profile.family)==XELP::DisplayAdapter::ADLS &&
+        XELP::kernelOS(version)==XELP::OS::Tahoe);
+    rplsMemoryRequested=rplsMemoryAdmitted && !checkKernelArgument("-wex-rpls-ggtt-compat-off") &&
+        !checkKernelArgument("-wex-noaccel") && !checkKernelArgument("-wex-tgl-off");
+    // RPLS_MEMORY_PROFILE_END
     display12SmallGTDetected=profile.admitted() && XELP::display12SmallGT(profile.gt);
     adlsDisplaySelected=profile.admitted() && XELP::displayAdapter(profile.family)==XELP::DisplayAdapter::ADLS;
     adlnNativeRCSProfileRequested=false;
@@ -12214,7 +12227,11 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			// accelerator rejected before either native lifecycle callback.
 			const bool resourcesReady=(!tglGT2Detected || tglGT2Ready) &&
 				(!display12SmallGTDetected || display12SmallGTReady);
-			tglAcceleratorReady = resourcesReady && surfaceABIReady && adlnObserved && skuReady && urbReady && ccsReady && hizReady && ccsPSReady && ggttOK && observed && ok && gucOK && dmaWriteOK && hostOK && scratchOK && blitInitOK && tglMMIOUCReady && copyOK && auxAlignOK && iosCCSOK && ffModeOK && cpsOK && flushOK && tlbPreparserOK && semaphoreTLBOK && hangOK && recoveryOK && completionCacheOK && contextCacheOK;
+			// RPLS_MEMORY_INSTALL_BEGIN
+			rplsMemoryInstall(patcher,index,address,size,currentGraphics);
+			// RPLS_MEMORY_INSTALL_END
+			tglAcceleratorReady = resourcesReady && surfaceABIReady && adlnObserved && skuReady && urbReady && ccsReady && hizReady && ccsPSReady && ggttOK && observed && ok && gucOK && dmaWriteOK && hostOK && scratchOK && blitInitOK && tglMMIOUCReady && copyOK && auxAlignOK && iosCCSOK && ffModeOK && cpsOK && flushOK && tlbPreparserOK && semaphoreTLBOK && hangOK && recoveryOK && completionCacheOK && contextCacheOK &&
+                (!rplsMemoryRequested || RPLSMemory::ready(rplsMemoryReceipt));
 			// r201: resource/copy diagnostics are absent, not admission requirements.
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLResourceDiagnosticsRemoved",true);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLAcceleratorAdmissionReady", tglAcceleratorReady);
@@ -13452,6 +13469,35 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
      adlsPowerReady=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
     }
     IORegistryEntry::getRegistryRoot()->setProperty("ADLSLanePowerReady",adlsPowerReady);
+    // G15 (03/11): o GOP do RPL-S/HX deixa o CDCLK em 172,8 MHz (decimal 0x158), fora da tabela do
+    // probeCDClockFrequency (307,2/312/552/556,8/648/652,8 MHz): o probe devolve 0 ("Wrong CD clock frequency 0x0
+    // set by EFI") e o display fica sem relogio (tela preta com o modeset completo). Como o sanitizeCDClockFrequency
+    // do WhateverGreen/NootedGreen: desliga o CDCLK e reprograma o PLL (652,8 MHz) antes do probe.
+    {
+     adlsDisableCDClock=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController14disableCDClockEv",address,size);
+     adlsSetCDClock=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController19setCDClockFrequencyEy",address,size);
+     patcher.clearError();
+     bool cdReady=adlsDisableCDClock && adlsSetCDClock && orgTGLRegisterRead;
+     if(cdReady) {
+      KernelPatcher::RouteRequest route("__ZN31AppleIntelFramebufferController21probeCDClockFrequencyEv",wrapADLSCDClockProbe,orgADLSCDClockProbe);
+      cdReady=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+     }
+     IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSCDClockFixReady",cdReady);
+    }
+    // G15 (09/11): no despertar que passa por Doze -> Wake o modeset completo vai direto ao treino do link sem ligar o
+    // painel (o prepareToEnterSleep o desligou e o LightUpEDP, que o liga, nao e chamado): AUX "Time out", link nao
+    // treina, sem imagem (teste 14). Depois de um repouso, se o PP_STATUS diz painel desligado, liga pelo
+    // hwSetPanelPower(1) da Apple antes do hwSetMode.
+    {
+     adlsPanelPowerFn=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController15hwSetPanelPowerEj",address,size);
+     patcher.clearError();
+     bool smReady=adlsPanelPowerFn && orgTGLRegisterRead;
+     if(smReady) {
+      KernelPatcher::RouteRequest route("__ZN31AppleIntelFramebufferController9hwSetModeEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2",wrapADLSSetMode,orgADLSSetMode);
+      smReady=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+     }
+     IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSSetModeReady",smReady);
+    }
     // Native startup remains closed if any required ADL-S adapter is absent.
     const auto contract=XELP::DisplayContract::adls(display12Available(),adlsWiring.dp!=0,adlsWiring.panel!=0);
     adlsDisplayHooksReady=contract.ready();
@@ -13807,20 +13853,34 @@ uint32_t XE::wrapTGLPanelTiming(void *controller) {
 
 // ADL-S native PWM panel adapter. The panel lifecycle remains synchronous
 // and donor-owned; only its period, polarity and duty arithmetic are replaced.
+// G15 (03/11): passo em que o alvo do PWM do painel falha (0 = passou), para o registro G15ADLSBacklightStep.
+static uint32_t g15PWMStep=0;
+// G15 (03/11): se o adaptador de PWM do WEX recusa o painel, o brilho cai no caminho nativo da Apple com o filtro do
+// NootedGreen/WhateverGreen (BacklightRegistersFix) em wrapTGLRegisterWrite: 0xC8254 fica com o periodo do hardware
+// (96000 no G15, o mesmo do i915) e o duty 0xC8258 e reescalado de periodo da Apple para o do hardware, com piso
+// wexblmin (padrao 4900 = 13/255, o minimo do painel na VBT). Sem a Apple gravar o periodo, wexblmax (padrao 17777).
+static uint32_t g15BlHw=0,g15BlApple=0,g15BlIn=0,g15BlOut=0,g15BlWrites=0;
+static bool g15BlNative=false,g15BlBypass=false;
 bool XE::adlsPanelPWMTarget(void *controller,void *&access,void *&power) {
  auto s=callbackXE;auto c=static_cast<uint8_t *>(controller);access=power=nullptr;
- if(!s->adlsDisplaySelected || XELP::displayAdapter(s->xeProfile.family)!=XELP::DisplayAdapter::ADLS || !s->adlsPanelPWMReady || !s->tglActive || !c || c!=s->tglObservationController ||
-    !s->tglTCNativeFunctions.complete() || *s->tglTCNativeFunctions.controllerSlot!=controller ||
-    !XELP::PanelPower::nativePPS0(s->firmwarePorts,s->xeProfile.family) || c[0x918] ||
-    *reinterpret_cast<void **>(c+0xD0) || *reinterpret_cast<void **>(c+0xD40)!=s->tglPlatformCopy ||
-    !s->orgTGLRegisterRead || !s->orgTGLRegisterWrite)return false;
+ uint32_t &st=g15PWMStep;st=1;
+ if(!s->adlsDisplaySelected || XELP::displayAdapter(s->xeProfile.family)!=XELP::DisplayAdapter::ADLS || !s->adlsPanelPWMReady || !s->tglActive)return false;
+ st=2;if(!c || c!=s->tglObservationController)return false;
+ st=3;if(!s->tglTCNativeFunctions.complete() || *s->tglTCNativeFunctions.controllerSlot!=controller)return false;
+ st=4;if(!XELP::PanelPower::nativePPS0(s->firmwarePorts,s->xeProfile.family))return false;
+ st=5;if(c[0x918])return false;
+ st=6;if(*reinterpret_cast<void **>(c+0xD0))return false;
+ st=7;if(*reinterpret_cast<void **>(c+0xD40)!=s->tglPlatformCopy)return false;
+ st=8;if(!s->orgTGLRegisterRead || !s->orgTGLRegisterWrite)return false;
  auto port=static_cast<uint8_t *>(s->tglTCNativeFunctions.portByDDI(0));
- if(!port || port[0x117] || *reinterpret_cast<uint32_t *>(port+0x550)!=1 || !s->adlsWiring.boundPanel(s->tglPlatformCopy,*reinterpret_cast<uint32_t **>(port+0x548)))return false;
+ st=9;if(!port || port[0x117])return false;
+ st=10;if(*reinterpret_cast<uint32_t *>(port+0x550)!=1)return false;
+ st=11;if(!s->adlsWiring.boundPanel(s->tglPlatformCopy,*reinterpret_cast<uint32_t **>(port+0x548)))return false;
  auto a=*reinterpret_cast<uint8_t **>(c+0xC40);auto p=*reinterpret_cast<uint8_t **>(c+0xC8);
- if(!a || !p || *reinterpret_cast<void **>(p+0x10)!=controller || p[0x18] ||
-    *reinterpret_cast<void **>(p+0x78)!=a || *reinterpret_cast<void **>(port+0x578)!=a ||
-    !*reinterpret_cast<void **>(a+0x50) || *reinterpret_cast<uint32_t *>(a+0x60)<0xC825C)return false;
- access=a;power=p;return true;
+ st=12;if(!a || !p || *reinterpret_cast<void **>(p+0x10)!=controller || p[0x18])return false;
+ st=13;if(*reinterpret_cast<void **>(p+0x78)!=a || *reinterpret_cast<void **>(port+0x578)!=a)return false;
+ st=14;if(!*reinterpret_cast<void **>(a+0x50) || *reinterpret_cast<uint32_t *>(a+0x60)<0xC825C)return false;
+ st=0;access=a;power=p;return true;
 }
 bool XE::adlsCapturePanelPWM(void *controller) {
  auto s=callbackXE;void *access,*power;
@@ -13832,37 +13892,92 @@ bool XE::adlsCapturePanelPWM(void *controller) {
  if(wells!=~0U && fuse!=~0U && (wells&1) && (fuse&0x01000000)) {
   const auto period=read(0xC8254),control=read(0xC8250);
   const auto &p=s->firmwarePorts.panel;
-  s->adlsPanelPWM=XELP::PanelPWM::select(period,control,period?0:read(0xC2014),p.pwmHz,p.activeLowPWM);
+  const auto strap=period?0:read(0xC2014);
+  s->adlsPanelPWM=XELP::PanelPWM::select(period,control,strap,p.pwmHz,p.activeLowPWM);
+  uint32_t cap[]={1,wells,fuse,period,control,strap,p.pwmHz,p.activeLowPWM,s->adlsPanelPWM.period};
+  IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSBacklightCapture",cap,sizeof(cap));
+ } else {
+  uint32_t cap[]={2,wells,fuse};
+  IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSBacklightCapture",cap,sizeof(cap));
  }
  f.putPG(power,1);return s->adlsPanelPWM.valid();
 }
 uint32_t XE::wrapADLSLightUpEDP(void *controller,void *fb,void *path,const void *timing) {
  auto s=callbackXE;
  if(s->display13FramebufferRequested && s->adlnOutputWiring.panel && !display13PanelCapture(controller))return kIOReturnNotReady;
+ // G15 (08/11): no G15 a captura do PWM falha sempre (fusivel 0x42000 = 0x8C000000, bit 24 zerado) e o LightUpEDP
+ // devolvia kIOReturnNotReady: no boot isso nao aparece (o GOP deixa o painel aceso e so ha modeset parcial), mas no
+ // despertar do repouso o modeset completo chama o LightUpEDP e falhava com 0xe00002d8 (tela preta). Agora, sem a
+ // captura, o painel acende pelo caminho nativo da Apple com o periodo do PWM lido do hardware (0xC8254), como o brilho.
+ // Registro: G15ADLSLightUp = {chamadas, captura ok, periodo usado, resultado, 12 registradores (ver abaixo), 0xE60, 0x6A15}.
+ static uint32_t lightCalls=0;uint32_t lrec[18]={++lightCalls,0,0,0,0};
  if(s->adlsDisplaySelected && s->adlsWiring.panel) {
-  if(!adlsCapturePanelPWM(controller))return kIOReturnNotReady;
-  *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE60)=s->adlsPanelPWM.period;
+  if(adlsCapturePanelPWM(controller)) {
+   lrec[1]=1;lrec[2]=s->adlsPanelPWM.period;
+   *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE60)=s->adlsPanelPWM.period;
+  } else {
+   void *access,*power;
+   if(adlsPanelPWMTarget(controller,access,power)) {
+    auto &f=s->tglTCNativeFunctions;f.getPG(power,1);
+    const auto period=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,0xC8254);
+    f.putPG(power,1);
+    if(period && period!=~0U) {lrec[2]=period;*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE60)=period;}
+   }
+  }
  }
  const auto result=FunctionCast(wrapADLSLightUpEDP,s->orgADLSLightUpEDP)(controller,fb,path,timing);
+ lrec[3]=result;
+ {
+  void *access,*power;
+  if(s->adlsDisplaySelected && adlsPanelPWMTarget(controller,access,power)) {
+   // G15 (08/11): depois do LightUpEDP: PP_STATUS, PP_CONTROL, PWM ctl/periodo/duty, DDI_BUF_CTL_A, TRANS_DDI_FUNC_CTL_A,
+   // TRANSCONF_A, PLANE_CTL_1_A, DC_STATE_EN, PWR_WELL_CTL2, CDCLK_CTL, e o 0xE60 (periodo da Apple) do controlador.
+   static const uint32_t regs[]={0xC7200,0xC7204,0xC8250,0xC8254,0xC8258,0x64000,0x60400,0x70008,0x70180,0x45504,0x45404,0x46000};
+   auto &f=s->tglTCNativeFunctions;f.getPG(power,1);
+   for(unsigned i=0;i<arrsize(regs);++i)lrec[4+i]=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,regs[i]);
+   f.putPG(power,1);
+   lrec[16]=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE60);
+   lrec[17]=0x6A15;  // marca do formato
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSLightUp",lrec,sizeof(lrec));
+ }
  if(s->display13FramebufferRequested && !display13PanelHealthy())return kIOReturnNotReady;
  return result;
 }
+static void g15PublishSleep();
 uint32_t XE::wrapADLSPanelBacklight(void *controller,uint32_t brightness) {
+ g15PublishSleep();
  auto s=callbackXE;
  if(s->display13FramebufferRequested && s->adlnOutputWiring.panel)return display13PanelBrightness(controller,brightness);
  if(!s->adlsDisplaySelected || !s->adlsWiring.panel)
   return FunctionCast(wrapADLSPanelBacklight,s->orgADLSPanelBacklight)(controller,brightness);
- void *access,*power;uint32_t duty;
- if(!adlsCapturePanelPWM(controller) || !adlsPanelPWMTarget(controller,access,power) ||
-    !s->adlsPanelPWM.duty(brightness,duty))return kIOReturnNotReady;
+ void *access,*power;uint32_t duty=0;
+ // G15 (03/11): registro de cada pedido de brilho (o slider nao mudava nada): pedido, captura, alvo, duty, periodo,
+ // polaridade, poços/fusivel e o que ficou no 0xC8258/0xC8254/0xC8250 depois.
+ static uint32_t calls=0;uint32_t rec[12]={2,++calls,brightness,0,0,0,0,s->adlsPanelPWM.period,s->adlsPanelPWM.polarity,0,0,0};
+ const bool captured=adlsCapturePanelPWM(controller);rec[3]=captured|(g15PWMStep<<8);
+ const bool target=captured && adlsPanelPWMTarget(controller,access,power);rec[4]=target;
+ const bool dutyOK=target && s->adlsPanelPWM.duty(brightness,duty);rec[5]=dutyOK;rec[6]=duty;rec[7]=s->adlsPanelPWM.period;
+ if(!dutyOK) {
+  rec[0]=4;g15BlNative=true;  // 4 = caminho nativo da Apple com o filtro do brilho
+  IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSBacklight",rec,sizeof(rec));
+  const auto r=FunctionCast(wrapADLSPanelBacklight,s->orgADLSPanelBacklight)(controller,brightness);
+  uint32_t nat[]={g15BlWrites,g15BlHw,g15BlApple,g15BlIn,g15BlOut,r};
+  IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSBacklightNative",nat,sizeof(nat));
+  return r;
+ }
  auto &f=s->tglTCNativeFunctions;f.getPG(power,1);
  const auto wells=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,0x45404);
  const auto fuse=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,0x42000);
  const bool ready=wells!=~0U && fuse!=~0U && (wells&1) && (fuse&0x01000000);
  if(ready) {
-  wrapTGLRegisterWrite(access,0xC8258,duty);
+  g15BlBypass=true;wrapTGLRegisterWrite(access,0xC8258,duty);g15BlBypass=false;
   *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE58)=brightness;
- }
+  rec[9]=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,0xC8258);
+  rec[10]=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,0xC8254);
+  rec[11]=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,0xC8250);
+ } else rec[0]=3;
+ IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSBacklight",rec,sizeof(rec));
  f.putPG(power,1);return ready?0:kIOReturnNotReady;
 }
 void XE::wrapADLSPanelPWMEnable(void *access) {
@@ -13870,7 +13985,18 @@ void XE::wrapADLSPanelPWMEnable(void *access) {
  if(s->display13FramebufferRequested){display13PanelPWMEnable(access);return;}uint32_t value=0x80000000;
  if(s->adlsDisplaySelected && s->adlsWiring.panel) {
   void *expected,*power;
-  if(!s->adlsPanelPWM.valid() || !adlsPanelPWMTarget(s->tglObservationController,expected,power) || access!=expected)return;
+  if(!s->adlsPanelPWM.valid()) {
+   // G15 (08/11): a captura do PWM falha sempre no G15 (fusivel 0x42000 bit 24) e aqui saia sem escrever nada. No boot o
+   // GOP deixa o PWM ligado, mas no despertar do repouso o 0xC8250 volta zerado (teste 7: PP_STATUS ligado, DDI/pipe/
+   // plano ativos, 0xC8250=0): tela sem luz de fundo. Faz a escrita que a Apple faria, com a polaridade da VBT.
+   static uint32_t g15Enable=0;g15Enable++;
+   if(s->firmwarePorts.panel.activeLowPWM)value|=1U<<29;
+   wrapTGLRegisterWrite(access,0xC8250,value);
+   uint32_t rec[]={g15Enable,value,wrapTGLRegisterRead(access,0xC8250)};
+   IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSPWMEnable",rec,sizeof(rec));
+   return;
+  }
+  if(!adlsPanelPWMTarget(s->tglObservationController,expected,power) || access!=expected)return;
   value|=s->adlsPanelPWM.polarity;
  }
  wrapTGLRegisterWrite(access,0xC8250,value);
@@ -15105,7 +15231,81 @@ bool tglCSBSerialize(void *,void *,OSSerialize *serializer) {
 }
 }
 
+// G15 (08/11): instrumentacao do repouso. Os panics do despertar (r113 EL-null / context-ID-mismatch) chegam com a pagina
+// de status da GPU invalida; para saber a ordem real, contam-se systemWillSleep/systemDidWake do IntelAccelerator,
+// o resetOnWake e os eventos de CSB desde o ultimo "vai dormir", e o panic sai com esses numeros (o que sobrevive).
+static mach_vm_address_t g15OrgWillSleep=0,g15OrgDidWake=0;
+static volatile uint32_t g15GpuAsleep=0;  // bit por motor (indice de tglCSBEngines)
+static volatile uint64_t g15CSBDropped=0,g15CSBStale=0,g15CSBFixed=0;
+static uint32_t g15StaleLog[8][8];static volatile uint32_t g15StaleN=0;
+// G15 (09/11): indice da lista ativa da Apple (streamer+0x50) e bit 0 do EXECLIST_STATUS por motor:
+// [0]=valido [1]=indice ao dormir [2]=EL_ST ao dormir [3]=indice no despertar (antes de restaurar) [4]=EL_ST no despertar
+static uint32_t g15ActiveIdx[6][5];
+static volatile uint64_t g15WillSleepN=0,g15DidWakeN=0,g15ResetWakeN=0,g15WillSleepT=0,g15DidWakeT=0,g15ResetWakeT=0,g15CSBSinceSleep=0,g15CSBSinceReset=0;
+static void g15SnapAll(unsigned phase);
+static void g15SaveActive();
+static uint64_t g15WrapWillSleep(void *acc) {
+ g15WillSleepN++;g15WillSleepT=mach_absolute_time();g15CSBSinceSleep=0;
+ g15SnapAll(0);
+ // Marca so depois do original: ele ainda espera a GPU ficar ociosa (eventos de conclusao precisam passar).
+ const auto r=reinterpret_cast<uint64_t (*)(void *)>(g15OrgWillSleep)(acc);
+ g15SaveActive();
+ g15GpuAsleep=0xFFFFFFFF;return r;
+}
+// G15 (08/11): registradores de cada motor (base = ponteiro do CSB - 0x3A0) em 3 momentos: 0 = cada tglCSBInitialize
+// antes do repouso (boot), 1 = no tglCSBInitialize do despertar, 2 = agora (refeito a cada publicacao). Registro
+// G15EngineRegs[fase][motor][16].
+static const uint16_t g15EngineOff[]={0x30,0x34,0x38,0x3C,0x80,0x98,0x9C,0xA8,0x180,0x234,0x238,0x29C,0x3A0,0x550};
+static uint32_t g15EngineRegs[3][6][16];
+static void g15EngineSnap(TGLCSBIO &io,unsigned phase) {
+ if(io.engine>=6 || io.pointerReg<0x3A0 || phase>2)return;
+ io.acquire();const auto base=io.pointerReg-0x3A0;auto r=g15EngineRegs[phase][io.engine];
+ r[0]=base;
+ for(unsigned i=0;i<arrsize(g15EngineOff);++i)r[1+i]=*reinterpret_cast<volatile uint32_t *>(io.bar+base+g15EngineOff[i]);
+ r[15]=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC);
+}
+static void g15SaveActive() {
+ for(unsigned e=0;e<6;++e)if(tglCSBEngines[e].streamer && tglCSBEngines[e].hardwareReady){
+  TGLCSBIO io(tglCSBEngines[e].streamer,0);if(io.engine>=6 || io.pointerReg<0x3A0)continue;io.acquire();
+  auto &a=g15ActiveIdx[io.engine];a[0]=1;a[1]=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+  a[2]=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg-0x3A0+0x234);
+ }
+}
+static void g15SnapAll(unsigned phase) {
+ for(unsigned e=0;e<6;++e)if(tglCSBEngines[e].streamer && tglCSBEngines[e].hardwareReady){TGLCSBIO io(tglCSBEngines[e].streamer,0);g15EngineSnap(io,phase);}
+}
+static void g15PublishSleep() {
+ g15SnapAll(2);
+ IORegistryEntry::getRegistryRoot()->setProperty("G15EngineRegs",g15EngineRegs,sizeof(g15EngineRegs));
+ uint64_t r[]={g15WillSleepN,g15DidWakeN,g15ResetWakeN,g15CSBDropped,g15CSBStale,g15CSBSinceReset,g15GpuAsleep};
+ IORegistryEntry::getRegistryRoot()->setProperty("G15SleepCounters",r,sizeof(r));
+ IORegistryEntry::getRegistryRoot()->setProperty("G15StaleLog",g15StaleLog,sizeof(g15StaleLog));
+ { uint64_t f=g15CSBFixed;IORegistryEntry::getRegistryRoot()->setProperty("G15CSBFixed",f,64); }
+}
+static uint64_t g15WrapDidWake(void *acc) {
+ g15DidWakeN++;g15DidWakeT=mach_absolute_time();
+ const auto ret=reinterpret_cast<uint64_t (*)(void *)>(g15OrgDidWake)(acc);
+ g15PublishSleep();return ret;
+}
+static uint64_t g15Since(uint64_t t) {
+ if(!t)return UINT64_MAX;uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-t,&ns);return ns/1000;
+}
+static void g15SleepPanic(const char *kind,const uint32_t *entry) {
+ if(!g15WillSleepN)return;
+ PANIC("igfx","G15-sono %s asleep=%x dropped=%llu stale=%llu entry=%x:%x willSleep=%llu didWake=%llu resetOnWake=%llu us_desde(willSleep=%llu didWake=%llu reset=%llu) csbDesdeSleep=%llu csbDesdeReset=%llu",
+  kind,(unsigned)g15GpuAsleep,g15CSBDropped,g15CSBStale,entry?entry[0]:0,entry?entry[1]:0,g15WillSleepN,g15DidWakeN,g15ResetWakeN,g15Since(g15WillSleepT),g15Since(g15DidWakeT),g15Since(g15ResetWakeT),
+  g15CSBSinceSleep,g15CSBSinceReset);
+}
+
 bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ {
+  KernelPatcher::RouteRequest g15routes[] {
+   {"__ZN16IntelAccelerator15systemWillSleepEv",g15WrapWillSleep,g15OrgWillSleep},
+   {"__ZN16IntelAccelerator13systemDidWakeEv",g15WrapDidWake,g15OrgDidWake}
+  };
+  const bool g15ok=patcher.routeMultiple(index,g15routes,2,address,size);patcher.clearError();
+  IORegistryEntry::getRegistryRoot()->setProperty("G15SleepTraceReady",g15ok);
+ }
  KernelPatcher::RouteRequest routes[] {
   {"__ZN26IGHardwareCommandStreamer54initEP22IOGraphicsAccelerator2P10IOWorkLoopP12IGScheduler510IGHwCsType",wrapTGLCSBInit,orgTGLCSBInit},
   {"__ZN26IGHardwareCommandStreamer511resetOnWakeEv",wrapTGLCSBWake,orgTGLCSBWake},
@@ -15204,13 +15404,67 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
  }
  return ok;
 }
-void XE::wrapTGLCSBWake(void *streamer) { tglCSBInitialize(streamer); }
+void XE::wrapTGLCSBWake(void *streamer) {
+ g15ResetWakeN++;g15ResetWakeT=mach_absolute_time();g15CSBSinceReset=0;
+ // G15 (08/11): o resetOnWake nativo so poe os ponteiros do CSB em 7 (modo de 6 eventos); NAO chamar (teste 9: panic
+ // "CSB12 native/software head mismatch"). O que falta no despertar e o modo: a GPU perde energia no repouso e o
+ // GFX_MODE volta ao padrao (6 eventos), mas o WhateverXe so liga o bit dos 12 eventos no initModeRegisters do boot;
+ // o consumidor de 12 lia as posicoes 6-11 com eventos velhos (panics EL-null/ID-mismatch dos testes 2-5). Religa o
+ // bit 3 (escrita mascarada 0x00080008, a mesma do boot) antes de reinicializar o CSB, com a GPU ainda sem trabalho.
+ {
+  static uint32_t calls=0;uint32_t rec[8]={++calls,0,0,0,0,0,0,0};
+  TGLCSBIO io(streamer,0);io.acquire();g15EngineSnap(io,1);
+  if(io.engine<6 && g15ActiveIdx[io.engine][0]) {
+   auto &a=g15ActiveIdx[io.engine];a[3]=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+   a[4]=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg-0x3A0+0x234);
+   // G15 (09/11): a GPU mantem o estado no Deep Idle (teste 11), inclusive o ponteiro de execlist atual; a Apple
+   // recomeca o indice dela e os eventos passam a apontar para a lista errada (teste 12). Restaura o de antes do repouso.
+   static int off=-1;if(off<0)off=checkKernelArgument("-wex-g15-wake-active-off");
+   if(!off && a[1]<2)*reinterpret_cast<uint32_t *>(io.streamer+0x50)=a[1];
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("G15ActiveIdx",g15ActiveIdx,sizeof(g15ActiveIdx));
+  auto reg=reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
+  const uint32_t before=*reg;
+  if(before!=~0U && !(before&8)){*reg=0x00080008;(void)*reg;}
+  rec[1]=io.engine;rec[2]=before;rec[3]=*reg;
+  rec[4]=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg);
+  static uint32_t last[6][4];if(io.engine<6){last[io.engine][0]=calls;last[io.engine][1]=before;last[io.engine][2]=rec[3];last[io.engine][3]=rec[4];}
+  IORegistryEntry::getRegistryRoot()->setProperty("G15WakeMode",last,sizeof(last));
+ }
+ // G15 (09/11, testes 11-13): no Deep Idle a GPU MANTEM o estado (registradores iguais ao dormir e ao despertar) e
+ // continua escrevendo eventos da posicao em que estava; o TGLCSB::initialize (feito para depois de um reset) forcava os
+ // ponteiros para 11 e a leitura ficava desalinhada para sempre (eventos de contextos ja retirados -> EL-null). Se o
+ // ponteiro de escrita do hardware e valido e bate com a copia na HWS, so alinha a leitura do WhateverXe e da Apple a
+ // ele (a GPU estava ociosa: nao ha evento pendente). Senao (estado de reset), inicializa como antes.
+ // -wex-g15-wake-resync-off volta sempre ao initialize.
+ {
+  TGLCSBIO io(streamer,0);io.acquire();
+  const uint32_t ptr=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg),wp=ptr&0xF;
+  const uint32_t hwsTail=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC);
+  static int off=-1;if(off<0)off=checkKernelArgument("-wex-g15-wake-resync-off");
+  static uint32_t rs[6][4];
+  auto &e=tglCSBEngines[io.engine];
+  const bool keep=!off && io.engine<6 && wp<TGLCSB::Capacity && hwsTail==wp && e.streamer==streamer && e.hardwareReady;
+  if(io.engine<6){rs[io.engine][0]++;rs[io.engine][1]=ptr;rs[io.engine][2]=hwsTail;rs[io.engine][3]=keep;}
+  if(keep) {
+   e.state.head=wp;e.state.error=TGLCSB::Error::None;
+   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=wp;++e.resets;
+  }
+  IORegistryEntry::getRegistryRoot()->setProperty("G15WakeResync",rs,sizeof(rs));
+  if(!keep)tglCSBInitialize(streamer);
+ }
+ for(unsigned i=0;i<arrsize(tglCSBEngines);++i)if(tglCSBEngines[i].streamer==streamer)__sync_fetch_and_and(&g15GpuAsleep,~(1U<<i));
+}
 void XE::wrapTGLCSBReset(void *streamer) {
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
- TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
+ g15CSBSinceSleep++;g15CSBSinceReset++;
+ // G15 (08/11): entre o systemWillSleep e o resetOnWake nao ha trabalho valido na GPU; os eventos que chegam (com a
+ // pagina de status velha/invalida) derrubavam o despertar (r113). Descarta; o resetOnWake reinicializa o CSB.
+ TGLCSBIO io(streamer,flags);
+ if(g15GpuAsleep&(1U<<io.engine)){g15CSBDropped++;return;}auto &engine=tglCSBEngines[io.engine];
  if (engine.streamer!=streamer ||
   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)!=engine.state.head)
   PANIC("igfx","CSB12 native/software head mismatch e=%u",io.engine);
@@ -15244,6 +15498,39 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
    case TGLCSB::Handler::ElementSwitch: handler=2;break;
    case TGLCSB::Handler::ActiveToIdle: handler=3;break;
    default: return false;
+  }
+  // G15 (08/11): nos primeiros 30 s depois do resetOnWake, o 1o evento de troca de contexto chegava sem item na lista
+  // ativa (EL-null) ou com outro contexto (ID-mismatch) e o validador nativo dava panic. Pre-valida como o
+  // ContextStatusBufferValidate da Apple (lista em streamer+0x30+ativo*16; item->contexto+0x7C == id do evento) e,
+  // nessa janela, descarta o evento velho (contador g15CSBStale) em vez de derrubar o sistema.
+  if (g15WillSleepN && g15Since(g15ResetWakeT)<30000000ULL) {
+   const auto active=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+   const uint32_t want=(entry.identity>>5)&0x7FF;
+   // id do contexto do 1o item da lista l (UINT32_MAX = sem item/contexto)
+   auto listId=[&](uint32_t l)->uint32_t {
+    if (l>1) return UINT32_MAX;
+    void *item=*reinterpret_cast<void **>(io.streamer+0x30+l*16);
+    if (!item) return UINT32_MAX;
+    auto ctx=*reinterpret_cast<uint8_t **>(item);
+    return ctx ? *reinterpret_cast<uint32_t *>(ctx+0x7C) : UINT32_MAX;
+   };
+   bool stale=false;uint32_t fixed=0;
+   const uint32_t idA=listId(active),idB=listId(active^1);
+   if (handler==1 || handler==3) {
+    if (idA!=want) {
+     // G15 (09/11, teste 11): os eventos reprovados eram REAIS (stamps pendentes com o ring ocioso no gpuRestart).
+     // Se o evento bate com a OUTRA lista, o indice ativo ficou defasado no despertar: corrige e entrega.
+     if (active<2 && idB==want) {*reinterpret_cast<uint32_t *>(io.streamer+0x50)=active^1;fixed=1;g15CSBFixed++;}
+     else stale=true;
+    }
+   } else if (handler==2) {
+    stale=active>1 || !*reinterpret_cast<void **>(io.streamer+0x38+active*16);
+   }
+   if ((stale || fixed) && g15StaleN<8) {
+    auto r=g15StaleLog[g15StaleN++];r[0]=handler;r[1]=active;r[2]=want;r[3]=idA;r[4]=idB;r[5]=fixed|(stale<<1);
+    r[6]=entry.flags;r[7]=io.engine;
+   }
+   if (stale) {g15CSBStale++;++engine.consumed;return true;}
   }
   // Original validators still run inside handlers. No manufactured legacy
   // flags, forced bank promotion, or pretend completion for unsupported waits.
@@ -15807,6 +16094,7 @@ void XE::wrapTGLHostCSB(void *streamer,uint32_t *entry,uint32_t *index) {
 // Both routes run only AFTER the native validator has rejected list state.
 // Preserve failure, enriching the persisted panic rather than suppressing it.
 static void tglHostCSBFatal(const char *reason,const uint32_t *entry,void *failedStreamer) {
+ g15SleepPanic(reason,entry);
  if(!tglFatalLogStorage.claim())PANIC("igfx","concurrent CSB fatal: %s entry=%x:%x",reason,entry?entry[1]:0,entry?entry[0]:0);
  uint64_t before=0,writes=0,immediate=0,finalBad=0;
  for (uint32_t i=0;i<tglHost.maps && i<arrsize(tglHost.map);++i) {
@@ -18979,6 +19267,55 @@ void XE::wrapTGLComboEnableClocks(void *controller,void *port,void *other,uint32
     FunctionCast(wrapTGLComboEnableClocks,callbackXE->orgComboEnableClocks)(controller,port,other,params);
 }
 
+uint32_t XE::wrapADLSSetMode(void *controller,void *fb,void *path,const void *timing) {
+    // G15 (09/11, testes 14-15): no despertar via Doze -> Wake o AUX do eDP dava "Time out" com o painel LIGADO
+    // (PP_STATUS 0x80000008) e "DBUF 2 power up timeout": a energia do canal AUX A (power well separado, que a Apple
+    // liga sob demanda) ficava desligada. Depois de um repouso: liga o painel se preciso, liga o power well do AUX A
+    // (PWR_WELL_CTL_AUX2 0x45444: bit1 pede, bit0 estado) e grava os registradores de energia antes/depois.
+    static uint32_t rec[24];
+    static const uint32_t regs[]={0x45404,0x45444,0x45504,0x45008,0x44FE8,0x64010,0xC7200,0xC7204};
+    void *access=*reinterpret_cast<void **>(static_cast<uint8_t *>(controller)+0xC40);
+    const bool after=g15WillSleepN && callbackXE->adlsDisplaySelected && callbackXE->adlsWiring.panel;
+    if(after) {
+        rec[0]++;
+        for(unsigned k=0;k<8;++k)rec[2+k]=wrapTGLRegisterRead(access,regs[k]);
+        const uint32_t st=rec[8];
+        if(callbackXE->adlsPanelPowerFn && st!=~0U && !(st&0x80000000U)) {
+            rec[1]|=1;reinterpret_cast<uint32_t (*)(void *,uint32_t)>(callbackXE->adlsPanelPowerFn)(controller,1);
+        }
+        static int auxOff=-1;if(auxOff<0)auxOff=checkKernelArgument("-wex-g15-auxa-off");
+        const uint32_t aux=wrapTGLRegisterRead(access,0x45444);
+        if(!auxOff && aux!=~0U && !(aux&1)) {
+            rec[1]|=2;wrapTGLRegisterWrite(access,0x45444,aux|2);
+            for(unsigned t=0;t<100 && !(wrapTGLRegisterRead(access,0x45444)&1);++t)IODelay(10);
+        }
+    }
+    const auto r=FunctionCast(wrapADLSSetMode,callbackXE->orgADLSSetMode)(controller,fb,path,timing);
+    if(after) {
+        rec[10]=r;
+        for(unsigned k=0;k<8;++k)rec[11+k]=wrapTGLRegisterRead(access,regs[k]);
+        rec[19]=0x5E7A;
+        IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSSetModePanel",rec,sizeof(rec));
+    }
+    return r;
+}
+uint64_t XE::wrapADLSCDClockProbe(void *controller) {
+    auto access=*reinterpret_cast<void **>(static_cast<uint8_t *>(controller)+0xC40);
+    const uint32_t decimal=wrapTGLRegisterRead(access,0x46000)&0x7FF,ref=wrapTGLRegisterRead(access,0x51004)>>29;
+    static const uint32_t known[]={0x264,0x26E,0x44E,0x458,0x50E,0x518};
+    bool supported=false;for(auto v:known)supported|=decimal==v;
+    // PLL = referencia x razao (~1300 MHz), como o ICL_CDCLK_PLL_FREQ_REF_* do NootedGreen; 0=19,2 1=24 2=38,4 MHz.
+    static const uint64_t pll[]={19200000ULL*68,24000000ULL*54,38400000ULL*34};
+    uint32_t record[]={1,decimal,ref,supported,0};
+    if(!supported && ref<3) {
+        FunctionCast(wrapADLSCDClockProbe,callbackXE->adlsDisableCDClock)(controller);
+        reinterpret_cast<void (*)(void *,uint64_t)>(callbackXE->adlsSetCDClock)(controller,pll[ref]);
+        record[4]=wrapTGLRegisterRead(access,0x46000)&0x7FF;
+    }
+    IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSCDClockFix",record,sizeof(record));
+    return FunctionCast(wrapADLSCDClockProbe,callbackXE->orgADLSCDClockProbe)(controller);
+}
+
 void XE::wrapADLSEnableClocks(void *controller,void *port,void *otherPort,uint32_t *params) {
     AlderLakeS::HDMIClock encoded;
     if(!adlsClockTarget(controller,port,otherPort) ||
@@ -19262,6 +19599,30 @@ void XE::tglObserveScanout(void *fb, void *plane, uint32_t event, bool done, uin
 // Per-thread slots span the synchronous gamma call; publication is after it has
 // returned and released its native register lock. Upload and readback stay separate.
 void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
+	if (callbackXE->adlsDisplaySelected && g15BlNative && !g15BlBypass && (reg == 0xC8254 || reg == 0xC8258) &&
+		callbackXE->orgTGLRegisterRead) {
+		static uint32_t blmax = 0, blmin = 0;
+		if (!blmax) {
+			if (!PE_parse_boot_argn("wexblmax", &blmax, sizeof(blmax)) || !blmax) blmax = 17777;
+			if (!PE_parse_boot_argn("wexblmin", &blmin, sizeof(blmin))) blmin = 4900;
+		}
+		if (!g15BlHw) g15BlHw = FunctionCast(wrapTGLRegisterRead, callbackXE->orgTGLRegisterRead)(access, 0xC8254);
+		const bool hwOK = g15BlHw && g15BlHw != ~0U;
+		if (reg == 0xC8254) {
+			if (value) g15BlApple = value;
+			if (hwOK) value = g15BlHw;
+		} else {
+			g15BlIn = value;
+			const uint32_t ref = g15BlApple ? g15BlApple : blmax;
+			if (hwOK && ref && ref != g15BlHw) {
+				const uint32_t lo = blmin < g15BlHw ? blmin : 0;
+				const uint64_t v = lo + uint64_t(value) * (g15BlHw - lo) / ref;
+				value = v > g15BlHw ? g15BlHw : uint32_t(v);
+			}
+			g15BlOut = value;
+		}
+		g15BlWrites++;  // o registro (G15ADLSBacklightNative) e publicado no wrapADLSPanelBacklight, fora deste caminho
+	}
 	if (callbackXE->tglActive && callbackXE->tglComboPLLFractionCaller &&
 		reinterpret_cast<uintptr_t>(__builtin_return_address(0)) == callbackXE->tglComboPLLFractionCaller) {
 		auto ctl = static_cast<uint8_t *>(callbackXE->tglObservationController);
