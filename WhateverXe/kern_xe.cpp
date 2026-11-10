@@ -19306,6 +19306,31 @@ uint32_t XE::wrapADLSSetMode(void *controller,void *fb,void *path,const void *ti
         if(callbackXE->adlsPanelPowerFn && st!=~0U && !(st&0x80000000U)) {
             rec[1]|=1;reinterpret_cast<uint32_t (*)(void *,uint32_t)>(callbackXE->adlsPanelPowerFn)(controller,1);
         }
+        // (10/11) Tela apagada por inatividade e acesa sem repouso (FB0 Doze -> Wake): G15ADLSSetModeFail mostrou o PLL do
+        // CDCLK DESLIGADO (0x46070 = 0x22: razao 34, sem o bit 31), DC_STATE_EN = 2 (DC6 permitido) e a fatia 1 do DBUF
+        // desligada; sem CDCLK o DBUF nao liga ("DBUF 2 power up timeout") e o AUX A da timeout. No boot o mesmo PLL so
+        // liga pelo nosso G15ADLSCDClockFix (a Apple calcula uma frequencia que o ADL-S nao tem). Aqui, se o PLL estiver
+        // desligado: tira o DC5/DC6 (como o "DC off" do i915 antes de mexer no display), religa o CDCLK pelo
+        // setCDClockFrequency da Apple com o PLL certo para a referencia e pede energia as duas fatias do DBUF.
+        // rec[1]: 4 = DC tirado, 8 = CDCLK religado, 16 = DBUF pedido. -wex-g15-wakefix-off desliga.
+        static int wakeFixOff=-1;if(wakeFixOff<0)wakeFixOff=checkKernelArgument("-wex-g15-wakefix-off");
+        const uint32_t cdpll=wrapTGLRegisterRead(access,0x46070);
+        if(!wakeFixOff && cdpll!=~0U && !(cdpll&0x80000000U)) {
+            const uint32_t dc=wrapTGLRegisterRead(access,0x45504);
+            if(dc!=~0U && (dc&3)) {rec[1]|=4;wrapTGLRegisterWrite(access,0x45504,dc&~3U);IODelay(100);}
+            const uint32_t ref=wrapTGLRegisterRead(access,0x51004)>>29;
+            static const uint64_t pll[]={19200000ULL*68,24000000ULL*54,38400000ULL*34};
+            if(ref<3 && callbackXE->adlsSetCDClock) {
+                rec[1]|=8;reinterpret_cast<void (*)(void *,uint64_t)>(callbackXE->adlsSetCDClock)(controller,pll[ref]);
+            }
+            static const uint32_t dbuf[]={0x45008,0x44FE8};
+            for(auto d:dbuf) {
+                const uint32_t v=wrapTGLRegisterRead(access,d);
+                if(v==~0U || (v&0x40000000U))continue;
+                rec[1]|=16;wrapTGLRegisterWrite(access,d,v|0x80000000U);
+                for(unsigned t=0;t<100 && !(wrapTGLRegisterRead(access,d)&0x40000000U);++t)IODelay(10);
+            }
+        }
         static int auxOff=-1;if(auxOff<0)auxOff=checkKernelArgument("-wex-g15-auxa-off");
         const uint32_t aux=wrapTGLRegisterRead(access,0x45444);
         if(!auxOff && aux!=~0U && !(aux&1)) {
@@ -19313,7 +19338,21 @@ uint32_t XE::wrapADLSSetMode(void *controller,void *fb,void *path,const void *ti
             for(unsigned t=0;t<100 && !(wrapTGLRegisterRead(access,0x45444)&1);++t)IODelay(10);
         }
     }
+    // (10/11) Tela apagada por inatividade (FB0 Wake -> Doze, sem repouso) e acesa de novo: "DBUF 2 power up timeout",
+    // AUX "ddi = 0 Time out" e link training falho mesmo com o AUX A ligado acima. O registro normal e sobrescrito pelo
+    // modeset seguinte; "G15ADLSSetModeFail" guarda so os que falham: {falhas, modeset #, resultado, acoes, 13 regs antes,
+    // 13 depois}. Regs: PWR_WELL_CTL1/2/3 (BIOS/driver/KVMR), AUX BIOS/driver, DC_STATE_EN, DBUF_CTL S1/S2, CDCLK_CTL,
+    // CDCLK_PLL_ENABLE, PP_STATUS, PP_CONTROL, DP_AUX_CH_CTL_A.
+    static const uint32_t fregs[]={0x45400,0x45404,0x45408,0x45440,0x45444,0x45504,0x45008,0x44FE8,0x46000,0x46070,0xC7200,0xC7204,0x64010};
+    uint32_t fbefore[13];
+    if(callbackXE->adlsDisplaySelected)for(unsigned k=0;k<13;++k)fbefore[k]=wrapTGLRegisterRead(access,fregs[k]);
     const auto r=FunctionCast(wrapADLSSetMode,callbackXE->orgADLSSetMode)(controller,fb,path,timing);
+    if(callbackXE->adlsDisplaySelected && r!=0) {
+        static uint32_t frec[30];
+        frec[0]++;frec[1]=rec[20];frec[2]=r;frec[3]=rec[1];
+        for(unsigned k=0;k<13;++k){frec[4+k]=fbefore[k];frec[17+k]=wrapTGLRegisterRead(access,fregs[k]);}
+        IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSSetModeFail",frec,sizeof(frec));
+    }
     if(after) {
         rec[10]=r;
         for(unsigned k=0;k<8;++k)rec[11+k]=wrapTGLRegisterRead(access,regs[k]);
