@@ -13861,6 +13861,8 @@ static uint32_t g15PWMStep=0;
 // wexblmin (padrao 4900 = 13/255, o minimo do painel na VBT). Sem a Apple gravar o periodo, wexblmax (padrao 17777).
 static uint32_t g15BlHw=0,g15BlApple=0,g15BlIn=0,g15BlOut=0,g15BlWrites=0;
 static bool g15BlNative=false,g15BlBypass=false;
+// G15 (09/11 noite): pedido de brilho em andamento (0..65535), usado pelo filtro para calcular o duty sem a conta da Apple.
+static volatile uint32_t g15BlReq=0;static volatile bool g15BlReqActive=false;
 bool XE::adlsPanelPWMTarget(void *controller,void *&access,void *&power) {
  auto s=callbackXE;auto c=static_cast<uint8_t *>(controller);access=power=nullptr;
  uint32_t &st=g15PWMStep;st=1;
@@ -13961,7 +13963,9 @@ uint32_t XE::wrapADLSPanelBacklight(void *controller,uint32_t brightness) {
  if(!dutyOK) {
   rec[0]=4;g15BlNative=true;  // 4 = caminho nativo da Apple com o filtro do brilho
   IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSBacklight",rec,sizeof(rec));
+  g15BlReq=brightness;g15BlReqActive=true;
   const auto r=FunctionCast(wrapADLSPanelBacklight,s->orgADLSPanelBacklight)(controller,brightness);
+  g15BlReqActive=false;
   uint32_t nat[]={g15BlWrites,g15BlHw,g15BlApple,g15BlIn,g15BlOut,r};
   IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSBacklightNative",nat,sizeof(nat));
   return r;
@@ -13970,6 +13974,20 @@ uint32_t XE::wrapADLSPanelBacklight(void *controller,uint32_t brightness) {
  const auto wells=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,0x45404);
  const auto fuse=FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,0x42000);
  const bool ready=wells!=~0U && fuse!=~0U && (wells&1) && (fuse&0x01000000);
+ if(!ready && s->adlsWiring.panel) {
+  // G15 (09/11 noite): depois de um modeset completo a captura do PWM passa (o fusivel 0x42000 le 0x8F000000 nessa
+  // hora), mas nos pedidos seguintes ele volta a 0x8C000000 (bit 24 zerado) e este caminho recusava TODO pedido
+  // (rec[0]=3, NotReady): o brilho parava de mudar. Sem o fusivel, vai para o caminho nativo com o filtro, como antes.
+  f.putPG(power,1);
+  rec[0]=5;rec[9]=fuse;g15BlNative=true;
+  IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSBacklight",rec,sizeof(rec));
+  g15BlReq=brightness;g15BlReqActive=true;
+  const auto r=FunctionCast(wrapADLSPanelBacklight,s->orgADLSPanelBacklight)(controller,brightness);
+  g15BlReqActive=false;
+  uint32_t nat[]={g15BlWrites,g15BlHw,g15BlApple,g15BlIn,g15BlOut,r};
+  IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSBacklightNative",nat,sizeof(nat));
+  return r;
+ }
  if(ready) {
   g15BlBypass=true;wrapTGLRegisterWrite(access,0xC8258,duty);g15BlBypass=false;
   *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(controller)+0xE58)=brightness;
@@ -19274,10 +19292,15 @@ uint32_t XE::wrapADLSSetMode(void *controller,void *fb,void *path,const void *ti
     // (PWR_WELL_CTL_AUX2 0x45444: bit1 pede, bit0 estado) e grava os registradores de energia antes/depois.
     static uint32_t rec[24];
     static const uint32_t regs[]={0x45404,0x45444,0x45504,0x45008,0x44FE8,0x64010,0xC7200,0xC7204};
+    // (09/11 noite) O mesmo vale FORA do repouso: uma troca de modo com o sistema rodando (60 <-> 120 Hz, preferencias
+    // do WindowServer) faz modeset completo e o link training falhava na fase 1 ("Phase 1 of link training failed",
+    // 0xe00002bc) com a tela preta. Agora a energia do painel/AUX A e garantida em todo modeset do eDP do ADL-S.
+    // rec[20] = modesets totais, rec[21] = repousos ate aqui. -wex-g15-setmode-sleeponly volta ao comportamento antigo.
     void *access=*reinterpret_cast<void **>(static_cast<uint8_t *>(controller)+0xC40);
-    const bool after=g15WillSleepN && callbackXE->adlsDisplaySelected && callbackXE->adlsWiring.panel;
+    static int sleepOnly=-1;if(sleepOnly<0)sleepOnly=checkKernelArgument("-wex-g15-setmode-sleeponly");
+    const bool after=(g15WillSleepN || !sleepOnly) && callbackXE->adlsDisplaySelected && callbackXE->adlsWiring.panel;
     if(after) {
-        rec[0]++;
+        rec[0]++;rec[20]++;rec[21]=static_cast<uint32_t>(g15WillSleepN);rec[1]=0;
         for(unsigned k=0;k<8;++k)rec[2+k]=wrapTGLRegisterRead(access,regs[k]);
         const uint32_t st=rec[8];
         if(callbackXE->adlsPanelPowerFn && st!=~0U && !(st&0x80000000U)) {
@@ -19296,6 +19319,8 @@ uint32_t XE::wrapADLSSetMode(void *controller,void *fb,void *path,const void *ti
         for(unsigned k=0;k<8;++k)rec[11+k]=wrapTGLRegisterRead(access,regs[k]);
         rec[19]=0x5E7A;
         IORegistryEntry::getRegistryRoot()->setProperty("G15ADLSSetModePanel",rec,sizeof(rec));
+        SYSLOG("igfx","G15ADLSSetModePanel #%u acoes=%u repousos=%u resultado=0x%x PP_STATUS %x->%x AUX2 %x->%x",
+            rec[20],rec[1],rec[21],r,rec[8],rec[17],rec[3],rec[12]);
     }
     return r;
 }
@@ -19614,7 +19639,18 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
 		} else {
 			g15BlIn = value;
 			const uint32_t ref = g15BlApple ? g15BlApple : blmax;
-			if (hwOK && ref && ref != g15BlHw) {
+			// G15 (09/11 noite): depois de um modeset completo o LightUpEDP poe o periodo do hardware (96000) no 0xE60 e a
+			// Apple passa a gravar esse mesmo periodo: com "ref != g15BlHw" o reescalonamento (e o piso wexblmin) era
+			// pulado, o brilho minimo virava duty 0 (tela apagada) e os niveis baixos ficavam abaixo do minimo do painel.
+			// O piso vale sempre.
+			if (hwOK && g15BlReqActive) {
+				// G15 (09/11 noite): depois de um modeset completo o duty da Apple deixa de acompanhar o pedido (o maximo
+				// vira ~31% e os degraus da rampa saem fora de ordem). Durante um pedido o duty vem do proprio pedido
+				// (0..65535), com o piso: igual ao que acontecia no boot (duty da Apple ~ pedido x 17777/65535).
+				const uint32_t lo = blmin < g15BlHw ? blmin : 0;
+				const uint32_t req = g15BlReq > 0xFFFF ? 0xFFFF : g15BlReq;
+				value = uint32_t(lo + uint64_t(req) * (g15BlHw - lo) / 0xFFFF);
+			} else if (hwOK && ref) {
 				const uint32_t lo = blmin < g15BlHw ? blmin : 0;
 				const uint64_t v = lo + uint64_t(value) * (g15BlHw - lo) / ref;
 				value = v > g15BlHw ? g15BlHw : uint32_t(v);
