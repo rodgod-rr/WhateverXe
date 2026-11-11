@@ -15494,7 +15494,45 @@ void XE::wrapTGLCSBWake(void *streamer) {
  }
  for(unsigned i=0;i<arrsize(tglCSBEngines);++i)if(tglCSBEngines[i].streamer==streamer)__sync_fetch_and_and(&g15GpuAsleep,~(1U<<i));
 }
+// G15 (11/11): travamentos da UHD (gpuRestart 801) mostram a GPU ociosa, nada no ELSP e stamps pendentes que nem
+// chegaram ao anel: o escalonador do host parou de despachar. Para separar as causas, cada processGPUReset registra
+// no log do kernel (sobrevive ao reinicio) o estado de TODOS os motores antes da reinicializacao do CSB:
+//  pend>0          -> eventos do CSB escritos pela GPU e nao consumidos;
+//  el*!=0 e pend=0 -> o software acha que ha contexto na GPU, mas a GPU nao mandou o evento de fim;
+//  tudo vazio      -> trabalho preso numa dependencia (semaforo/fence), nao no CSB.
+// So leitura (MMIO com forcewake, como o proprio reset). `log show --predicate 'eventMessage CONTAINS "G15-gpureset"'`.
+static uint64_t g15LastCSBT[6];
+static uint32_t g15ResetLogN=0;
+static void g15LogResetState(void *resetStreamer) {
+ const uint32_t n=++g15ResetLogN;
+ unsigned resetEngine=UINT32_MAX;
+ for(unsigned e=0;e<arrsize(tglCSBEngines);++e)if(tglCSBEngines[e].streamer==resetStreamer)resetEngine=e;
+ for(unsigned e=0;e<arrsize(tglCSBEngines);++e) {
+  auto &eng=tglCSBEngines[e];
+  if(!eng.streamer || !eng.hardwareReady)continue;
+  TGLCSBIO io(eng.streamer,0);io.acquire();
+  const uint32_t hwsTail=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC);
+  const uint32_t ptr=*reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg);
+  const uint32_t head=eng.state.head,native=*reinterpret_cast<uint32_t *>(io.streamer+0x1C04);
+  const uint32_t active=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+  const uint32_t pend=(hwsTail<TGLCSB::Capacity && head<TGLCSB::Capacity)?(hwsTail+TGLCSB::Capacity-head)%TGLCSB::Capacity:99;
+  const uint64_t next=pend && pend!=99?io.readEntry((head+1)%TGLCSB::Capacity):0;
+  // listas de execucao do software: lista l em streamer+0x30+l*16, 2 itens; item->contexto, contexto+0x7C = id
+  uint32_t ids[4];
+  for(unsigned i=0;i<4;++i) {
+   void *item=*reinterpret_cast<void **>(io.streamer+0x30+i*8);
+   auto ctx=item?*reinterpret_cast<uint8_t **>(item):nullptr;
+   ids[i]=!item?0:ctx?*reinterpret_cast<uint32_t *>(ctx+0x7C):0xFFFFFFFF;
+  }
+  const uint64_t since=g15LastCSBT[e]?g15Since(g15LastCSBT[e])/1000:UINT64_MAX;
+  IOLog("G15-gpureset #%u e=%u(reset=%u) head=%u native=%u hwsTail=%u ptr=%x pend=%u next=%llx act=%u "
+   "el0=%x,%x el1=%x,%x csbMs=%llu consumed=%llu err=%u asleep=%x\n",
+   n,e,resetEngine,head,native,hwsTail,ptr,pend,next,active,ids[0],ids[1],ids[2],ids[3],since,eng.consumed,
+   static_cast<unsigned>(eng.state.error),(unsigned)g15GpuAsleep);
+ }
+}
 void XE::wrapTGLCSBReset(void *streamer) {
+ g15LogResetState(streamer);
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
 }
@@ -15503,6 +15541,7 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
  // G15 (08/11): entre o systemWillSleep e o resetOnWake nao ha trabalho valido na GPU; os eventos que chegam (com a
  // pagina de status velha/invalida) derrubavam o despertar (r113). Descarta; o resetOnWake reinicializa o CSB.
  TGLCSBIO io(streamer,flags);
+ if(io.engine<6)g15LastCSBT[io.engine]=mach_absolute_time();
  if(g15GpuAsleep&(1U<<io.engine)){g15CSBDropped++;return;}auto &engine=tglCSBEngines[io.engine];
  if (engine.streamer!=streamer ||
   *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)!=engine.state.head)
