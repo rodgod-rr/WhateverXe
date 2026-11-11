@@ -589,9 +589,18 @@ uint32_t tglHostPMNotify(void *controller,uint32_t priority,uint32_t event,uint6
 // Schema: revision, valid, ns, RPSTAT1, RC6, Apple active counter, Apple freq,
 // requested/boost metadata, GuC/residency flags, read number. Limit 512 per boot.
 // Schema 285 appends callback calls/answers, last encoded request, and RP caps.
+// Schema 286 (G15, #87): read-only forcewake/RC6 view, no forcewake taken:
+// FORCEWAKE_ACK_GT 0x130044, ACK_RENDER 0xD84, ACK_MEDIA 0xD88, FORCEWAKE_GT 0xA188,
+// FORCEWAKE_RENDER 0xA278, FORCEWAKE_MEDIA 0xA270, RC_CONTROL 0xA090, RC_STATE 0xA094.
+// Schema 287 (G15, #87): per engine RCS/BCS/VCS0/VECS0, read-only, no forcewake:
+// MI_MODE (+0x9C, bit 9 idle), HEAD<<32|TAIL (+0x34/+0x30), ACTHD (+0x74), EXECLIST_STATUS_LO (+0x234).
+// Schema 288 (G15, #87): RC6 setup, read-only: RC6_LOCATION 0xD40, RC6_CTX_BASE 0xD48,
+// EI 0xA0A8, IDLE_HYST 0xA0AC, RC_SLEEP 0xA0B0, RC6_THRESHOLD 0xA0B8, PG_HYST 0xA0C4,
+// PG_ENABLE 0xA210, GUC_WOPCM_SIZE 0xC050, GUC_WOPCM_OFFSET 0xC340, GT_CORE_STATUS 0x138060,
+// RC6 wake rate limit 0xA09C.
 bool tglPowerSerialize(void *target,void *,OSSerialize *serializer) {
  static uint32_t reads=0;
- uint64_t q[16] {285};
+ uint64_t q[52] {288};
  q[12]=__atomic_load_n(&tglHostRPSCalls,__ATOMIC_RELAXED);
  q[13]=__atomic_load_n(&tglHostRPSAnswered,__ATOMIC_RELAXED);
  q[14]=__atomic_load_n(&tglHostRPSLast,__ATOMIC_RELAXED);
@@ -609,6 +618,18 @@ bool tglPowerSerialize(void *target,void *,OSSerialize *serializer) {
     q[7]=*reinterpret_cast<uint32_t *>(ctl+0xec8);
     q[8]=*reinterpret_cast<uint32_t *>(ctl+0xecc);
     q[9]=ctl[0xb68];q[10]=ctl[0x1904]|(uint32_t(ctl[0x1980])<<8);
+    const uint32_t fw[] {0x130044,0xD84,0xD88,0xA188,0xA278,0xA270,0xA090,0xA094};
+    for(unsigned i=0;i<8;++i)q[16+i]=*reinterpret_cast<volatile uint32_t *>(base+fw[i]);
+    if(*reinterpret_cast<uint32_t *>(access+0x60)>=0x1C9000) {
+     const uint32_t eng[] {0x2000,0x22000,0x1C0000,0x1C8000};
+     for(unsigned e=0;e<4;++e) {
+      auto r=[&](uint32_t o){return uint64_t(*reinterpret_cast<volatile uint32_t *>(base+eng[e]+o));};
+      auto m=q+24+e*4;
+      m[0]=r(0x9C);m[1]=r(0x34)<<32|r(0x30);m[2]=r(0x74);m[3]=r(0x234);
+     }
+    }
+    const uint32_t rc[] {0xD40,0xD48,0xA0A8,0xA0AC,0xA0B0,0xA0B8,0xA0C4,0xA210,0xC050,0xC340,0x138060,0xA09C};
+    for(unsigned i=0;i<12;++i)q[40+i]=*reinterpret_cast<volatile uint32_t *>(base+rc[i]);
     q[1]=1;
    }
   }
