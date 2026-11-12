@@ -1,4 +1,4 @@
-// G15: DMC do ADL-S/RPL-S (adls_dmc_ver2_01.bin do linux-firmware, i915/; licenca LICENCE.i915 do linux-firmware).
+// G15: DMC do ADL-S/RPL-S (adls_dmc_ver2_01.bin do linux-firmware, i915/; licenca: LICENSE.i915 nesta pasta, copia de linux-firmware LICENSES/LICENSE.i915).
 // Gerado por script: programa principal (base 0x80000) e lista de MMIO. Nao editar.
 static const uint32_t g15AdlsDmcMmio[][2]={{0x8f074,0x86fc0},{0x8f034,0xc003b400},{0x8f004,0x1a40188},{0x8f038,0xc003b200},{0x8f008,0x3dc43bf4},{0x8f03c,0xc0033200},{0x8f00c,0x40b8408c}};
 static const uint32_t g15AdlsDmc[4196]={
