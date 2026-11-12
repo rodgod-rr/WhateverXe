@@ -95,6 +95,9 @@
 #include <IOKit/IOMapper.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
 #include <IOKit/IOUserClient.h>
+#include <sys/sysctl.h>
+#include <kern/thread_call.h>
+#include <kern/clock.h>
 #include <IOKit/IOEventSource.h>
 #include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -3479,6 +3482,359 @@ static bool tglTransitionRegister(unsigned long reg) {
 static TGLTrainingScopes tglTrainingScopes;
 static bool tglQuietTraining() {
 	return !tglDisplayTraceEnabled || tglTrainingScopes.active(reinterpret_cast<uintptr_t>(current_thread()));
+}
+
+// G15 (11/11): PSR1 do eDP interno, para o pacote sair de PC2/PC3 com a tela acesa e parada (WhateverXe #87).
+// So existe com o boot-arg wexg15psr=<modo> (sem ele nada aqui roda). O modo tambem muda na hora, sem sudo:
+//   sysctl debug.g15psr=<modo>  bit0 liga o PSR1 (rastreio por hardware: flip e cursor saem sozinhos, como o i915 em skl+)
+//                               bit1 PIPE_MISC[20]: a interrupcao de vblank ligada deixa de barrar a entrada (a Apple faz)
+//                               bit2 permite o DC6 com o PSR ligado (enableHWDC6 da Apple: ela tira o DC6 em volta da gama)
+//                               bit3 link em standby (como o EDPPSREnter da Apple) em vez de link desligado
+//                               bit4 PSR_CTL[12]: sai sem o despertar por AUX; bits 8-11 quadros parados ate entrar (0 = 6)
+// (11/11 21:40, 1o teste) a Apple desliga a energia do AUX A (0x45444) depois de cada transacao; o hardware precisa dela para
+// acordar o painel na saida (o i915 segura o AUX_IO com o PSR ligado): sem ela as saidas paravam em AUXACK e o painel ficava
+// em "ressincronizando" (DPCD 0x2008 = 4). Agora o pedido fica ligado enquanto o PSR estiver ligado (g15PsrAuxHeld).
+//   sysctl debug.g15psr_info    registradores e contadores; debug.g15psr_sink le o DPCD do painel (AUX)
+//   sysctl debug.g15reg=<reg>   le um registrador do display (diagnostico)
+// Sequencia do i915 v6.6 (intel_psr.c, PSR1): DPCD 0x170, cabecalho VSC, PSR_MASK, PSR_IMR, PSR_CTL (tempos do VBT:
+// TP1 e TP2/3 2500 us, link desligado). Saida (g15PsrSourceOff): 1 modeset, 2 disableDisplay, 3 repouso, 4 escrita que
+// desliga pipe/DDI/painel/CDCLK, 6 sysctl, 7 corrida com o armar. Rearma 3 s depois de cada modeset do eDP.
+static struct {void *ctl,*port;mach_vm_address_t rd,wr,auxRd,auxWr,dcOn,dcOff;} g15Psr;
+static IOLock *g15PsrLock=nullptr;static thread_call_t g15PsrCall=nullptr;
+static volatile uint32_t g15PsrMode=0,g15PsrOn=0,g15PsrGen=0,g15DcOn=0,g15PsrPm=0,g15PsrAuxHeld=0;
+static mach_vm_address_t g15DcOrgFastRd=0,g15DcOrgFastWr=0;
+static uint32_t g15PsrFail=0,g15PsrArms=0,g15PsrOffs[8]={},g15PsrPeek=0x60800,g15PsrDpcd=0x2008;
+static uint8_t g15PsrCaps[3]={};
+static uint32_t g15PsrR(uint32_t reg) {
+ auto a=*reinterpret_cast<void **>(static_cast<uint8_t *>(g15Psr.ctl)+0xC40);
+ return reinterpret_cast<uint32_t (*)(void *,unsigned long)>(g15Psr.rd)(a,reg);
+}
+static void g15PsrW(uint32_t reg,uint32_t v) {
+ auto a=*reinterpret_cast<void **>(static_cast<uint8_t *>(g15Psr.ctl)+0xC40);
+ reinterpret_cast<void (*)(void *,unsigned long,uint32_t)>(g15Psr.wr)(a,reg,v);
+}
+// G15 (12/11): DC5/DC6 com a tela acesa, por software (modo bit 2; bit 5 = so DC5). O modo 7 antigo (enableHWDC6 direto)
+// travou o WindowServer: sem TCON a Apple nao tira o DC6 antes do flip e a escrita no display desenergizado se perde.
+// Agora, como o DC_OFF do i915 em cada commit: todo acesso ao display pelos acessores (Read/Write/FastRead/FastWrite
+// Register32, faixas 0x40000-0xBFFFF e 0x16xxxx) tira o DC antes (g15DcTouch -> g15DcBlock, com spinlock e MMIO direto) e
+// o DC so volta depois de 300 ms sem acesso (g15DcTimer). A cada saida confere registradores contra a foto tirada antes
+// de permitir o DC; divergencia = g15DcBad (nao permite mais neste boot) e fica em debug.g15psr_info ("dcsw ...").
+// debug.g15dmc=1 troca o DMC da Apple (que nao e nenhum da Intel) pelo adls_dmc_ver2_01, como o intel_dmc_load_program.
+#include "kern_g15_adls_dmc.hpp"
+static IOSimpleLock *g15DcSpin=nullptr;static thread_call_t g15DcCall=nullptr;
+static volatile uint8_t *g15DcBase=nullptr;
+static volatile uint32_t g15DcArmed=0,g15DcBad=0,g15DcHooks=0;
+static volatile uint64_t g15DcLast=0;
+static uint32_t g15DcState=2,g15DcBlocks=0,g15DcAllows=0,g15DcMis=0,g15DcMisLog[6]={},g15DcWaitMax=0;static int g15DmcResult=-1;
+static const uint32_t g15DcRegs[][2]={{0x70008,0x80000000U},{0x60000,~0U},{0x6000C,~0U},{0x60400,~0U},{0x64000,0x8000000EU},
+ {0x70180,~0U},{0x70190,~0U},{0x6001C,~0U},{0x46000,~0U},{0x46070,0x80000000U},{0x46010,0x80000000U},{0x164280,~0U},
+ {0x60860,~0U},{0x45008,0x80000000U}};
+static uint32_t g15DcSnap[arrsize(g15DcRegs)];
+static inline uint32_t g15DcRd(uint32_t reg){return *reinterpret_cast<volatile uint32_t *>(g15DcBase+reg);}
+static inline void g15DcWr(uint32_t reg,uint32_t v){*reinterpret_cast<volatile uint32_t *>(g15DcBase+reg)=v;}
+static void g15DcSet(uint32_t state) { // gen9_write_dc_state do i915: regrava ate o DMC aceitar
+ const uint32_t want=(g15DcRd(0x45504)&~3U)|state;
+ g15DcWr(0x45504,want);
+ for(unsigned rw=0,rr=0;rw<100;) {
+  if(g15DcRd(0x45504)!=want){g15DcWr(0x45504,want);++rw;rr=0;} else if(rr++>5)break;
+ }
+}
+static void g15DcSchedule(uint32_t ms){uint64_t dl;clock_interval_to_deadline(ms,1000000,&dl);thread_call_enter_delayed(g15DcCall,dl);}
+static void g15DcBlock() {
+ bool did=false;
+ const IOInterruptState is=IOSimpleLockLockDisableInterrupt(g15DcSpin);
+ if(g15DcOn) {
+  g15DcSet(0);
+  unsigned t=0;for(;t<4000 && !(g15DcRd(0x70008)&0x80000000U);++t)IODelay(5);
+  if(t>g15DcWaitMax)g15DcWaitMax=t;
+  for(unsigned k=0;k<arrsize(g15DcRegs);++k) {
+   const uint32_t now=g15DcRd(g15DcRegs[k][0]);
+   if(!((now^g15DcSnap[k])&g15DcRegs[k][1]))continue;
+   if(g15DcMis<2){g15DcMisLog[3*g15DcMis]=g15DcRegs[k][0];g15DcMisLog[3*g15DcMis+1]=g15DcSnap[k];g15DcMisLog[3*g15DcMis+2]=now;}
+   ++g15DcMis;g15DcBad=1;
+  }
+  g15DcOn=0;++g15DcBlocks;did=true;
+ }
+ IOSimpleLockUnlockEnableInterrupt(g15DcSpin,is);
+ if(did && g15DcArmed && !g15DcBad)g15DcSchedule(150);
+}
+static inline void g15DcTouch(unsigned long reg) {
+ if(!g15DcArmed || !((reg>=0x40000 && reg<0xC0000) || (reg>=0x160000 && reg<0x170000)))return;
+ g15DcLast=mach_absolute_time();
+ __sync_synchronize();
+ if(g15DcOn)g15DcBlock();
+}
+static void g15DcTimer(thread_call_param_t,thread_call_param_t) {
+ if(!g15DcArmed || g15DcBad || !g15DcBase)return;
+ uint64_t ns;const uint64_t last=g15DcLast;absolutetime_to_nanoseconds(mach_absolute_time()-last,&ns);
+ if(ns<300000000ULL){g15DcSchedule(150);return;}
+ const IOInterruptState is=IOSimpleLockLockDisableInterrupt(g15DcSpin);
+ for(unsigned k=0;k<arrsize(g15DcRegs);++k)g15DcSnap[k]=g15DcRd(g15DcRegs[k][0]);
+ g15DcOn=1;__sync_synchronize();
+ const bool ok=g15DcLast==last && g15DcArmed && (g15DcSnap[0]&0x80000000U);
+ if(ok){g15DcSet(g15DcState);++g15DcAllows;} else g15DcOn=0;
+ IOSimpleLockUnlockEnableInterrupt(g15DcSpin,is);
+ if(!ok && g15DcArmed)g15DcSchedule(150);
+}
+static void g15DcDisarm() {
+ if(!g15DcSpin)return;
+ g15DcArmed=0;__sync_synchronize();
+ g15DcBlock();
+}
+static uint32_t g15DcFastRd(void *a,unsigned long reg) {
+ g15DcTouch(reg);return reinterpret_cast<uint32_t (*)(void *,unsigned long)>(g15DcOrgFastRd)(a,reg);
+}
+static void g15DcFastWr(void *a,unsigned long reg,uint32_t v) {
+ g15DcTouch(reg);reinterpret_cast<void (*)(void *,unsigned long,uint32_t)>(g15DcOrgFastWr)(a,reg,v);
+}
+static void g15PsrInit(uint32_t mode);
+// Fora do processKextFull (o quadro de pilha dele esta no limite do build). FastRead/FastWrite tambem passam pelo
+// g15DcTouch (o FastWrite pode ja ter rota da WEX: ai o toque fica no wrapTGLFastRegisterWrite).
+__attribute__((noinline)) static void g15PsrBoot(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size,bool fastWrRouted) {
+ uint32_t psr=0;
+ if(!PE_parse_boot_argn("wexg15psr",&psr,sizeof(psr)))return;
+ g15PsrInit(psr);
+ KernelPatcher::RouteRequest dcRd("__ZN31AppleIntelRegisterAccessManager18FastReadRegister32Em",g15DcFastRd,g15DcOrgFastRd);
+ uint32_t hooks=patcher.routeMultiple(index,&dcRd,1,address,size)?1:0;patcher.clearError();
+ if(fastWrRouted)hooks|=2;
+ else {
+  KernelPatcher::RouteRequest dcWr("__ZN31AppleIntelRegisterAccessManager19FastWriteRegister32Emj",g15DcFastWr,g15DcOrgFastWr);
+  if(patcher.routeMultiple(index,&dcWr,1,address,size))hooks|=2;
+  patcher.clearError();
+ }
+ g15DcHooks=hooks;
+}
+// Com o PSR desligado e o DC fora (chamado com o g15PsrLock e o spinlock). 0 = carregado e conferido.
+static int g15DmcLoad() {
+ if(!g15DcBase || g15PsrOn || g15DcOn)return 1;
+ if(g15DcRd(0x45504)&3)return 2;
+ for(unsigned h=0;h<8;++h){g15DcWr(0x8F034+4*h,0x00030100U);g15DcWr(0x8F004+4*h,0);} // tratadores fora
+ for(unsigned i=0;i<arrsize(g15AdlsDmc);++i)g15DcWr(0x80000+4*i,g15AdlsDmc[i]);
+ for(unsigned i=0;i<arrsize(g15AdlsDmc);++i)if(g15DcRd(0x80000+4*i)!=g15AdlsDmc[i])return 3;
+ for(unsigned i=0;i<arrsize(g15AdlsDmcMmio);++i)g15DcWr(g15AdlsDmcMmio[i][0],g15AdlsDmcMmio[i][1]);
+ g15DcWr(0x45520,g15DcRd(0x45520)|3U);          // DC_STATE_DEBUG: MASK_CORES | MASK_MEMORY_UP
+ g15DcWr(0x46434,g15DcRd(0x46434)|0x0F000000U); // Wa_14011508470 (tgl, rkl, adl-s)
+ return 0;
+}
+// Pode rodar em qualquer contexto (so registradores): tira o DC6, desliga o PSR na fonte e espera o estado ocioso.
+static void g15PsrSourceOff(unsigned cause) {
+ if(!g15PsrLock)return;
+ __sync_fetch_and_add(&g15PsrGen,1);
+ if(!__sync_bool_compare_and_swap(&g15PsrOn,1,0))return;
+ g15DcDisarm();
+ const uint32_t v=g15PsrR(0x60800);
+ if(v!=~0U && (v&0x80000000U))g15PsrW(0x60800,v&~0x80000000U);
+ for(unsigned t=0;t<500 && (g15PsrR(0x60840)&0xE0000000U);++t)IODelay(100);
+ if(__sync_lock_test_and_set(&g15PsrPm,0)){const uint32_t pm=g15PsrR(0x70030);if(pm!=~0U)g15PsrW(0x70030,pm&~0x00100000U);}
+ if(__sync_lock_test_and_set(&g15PsrAuxHeld,0)){const uint32_t pw=g15PsrR(0x45444);if(pw!=~0U)g15PsrW(0x45444,pw&~2U);}
+ if(cause<8)g15PsrOffs[cause]++;
+}
+static void g15PsrLeave(unsigned cause) {
+ if(!g15PsrLock)return;
+ if(g15PsrCall)thread_call_cancel(g15PsrCall);
+ if(g15DcCall)thread_call_cancel(g15DcCall);
+ g15PsrSourceOff(cause);
+}
+static bool g15PsrAux(bool write,uint32_t addr,uint8_t *data,uint32_t n) {
+ uint32_t buf[4]={};
+ if(n>sizeof(buf))return false;
+ const uint32_t pw=g15PsrR(0x45444);
+ if(pw!=~0U && !(pw&1)){g15PsrW(0x45444,pw|2);for(unsigned t=0;t<100 && !(g15PsrR(0x45444)&1);++t)IODelay(10);}
+ if(write)memcpy(buf,data,n);
+ const auto fn=reinterpret_cast<uint32_t (*)(void *,uint32_t,void *,uint32_t)>(write?g15Psr.auxWr:g15Psr.auxRd);
+ const uint32_t r=fn(g15Psr.port,addr,buf,n);
+ if(!write && !r)memcpy(data,buf,n);
+ return !r;
+}
+static bool g15PsrPanelOn() {
+ const uint32_t tc=g15PsrR(0x70008),ddi=g15PsrR(0x64000),pp=g15PsrR(0xC7200);
+ return tc!=~0U && (tc&0x80000000U) && (ddi&0x80000000U) && (pp&0x80000000U);
+}
+// Contexto de thread (AUX). falha: 1 painel/pipe desligado, 2 PSR ja ligado por outro, 3 AUX, 4 painel sem PSR,
+// 5 escrita do DPCD 0x170, 6 saida pedida no meio.
+static void g15PsrArmLocked() {
+ const uint32_t mode=g15PsrMode;
+ if(!(mode&1) || g15PsrOn || !g15Psr.ctl || !g15Psr.port || !g15Psr.rd || !g15Psr.wr || !g15Psr.auxRd || !g15Psr.auxWr)return;
+ const uint32_t gen=g15PsrGen;
+ g15PsrFail=0;
+ if(!g15PsrPanelOn()){g15PsrFail=1;return;}
+ const uint32_t ctl=g15PsrR(0x60800);
+ if((ctl&0x80000000U) || (g15PsrR(0x60900)&0x80000000U)){g15PsrFail=2;return;}
+ uint8_t caps[2]={},rev=0,lanes=0;
+ if(!g15PsrAux(false,0x70,caps,2)){g15PsrFail=3;return;}
+ g15PsrAux(false,0x700,&rev,1);g15PsrAux(false,0x2,&lanes,1);
+ g15PsrCaps[0]=caps[0];g15PsrCaps[1]=caps[1];g15PsrCaps[2]=rev;
+ if(!caps[0]){g15PsrFail=4;return;}
+ const bool standby=mode&8;
+ uint8_t cfg=standby?0x07:0x05,d0=1; // ENABLE | CRC_VERIFICATION (| MAIN_LINK_ACTIVE)
+ if(!g15PsrAux(true,0x170,&cfg,1)){g15PsrFail=5;return;}
+ g15PsrAux(true,0x600,&d0,1);
+ if(gen!=g15PsrGen){g15PsrFail=6;return;}
+ { // energia do AUX A pedida ate a saida (a Apple a desliga ao fim de cada transacao)
+  const uint32_t pw=g15PsrR(0x45444);
+  if(pw!=~0U && !(pw&2)){g15PsrAuxHeld=1;g15PsrW(0x45444,pw|2);}
+  for(unsigned t=0;t<100 && !(g15PsrR(0x45444)&1);++t)IODelay(10);
+ }
+ g15PsrW(0x60320,0x08020700U); // cabecalho do VSC SDP do PSR1 (rev 2, 8 bytes), igual ao i915 e a Apple
+ for(unsigned k=1;k<9;++k)g15PsrW(0x60320+4*k,0);
+ g15PsrW(0x60200,g15PsrR(0x60200)|0x00100000U);
+ g15PsrW(0x60860,0x1E000000U); // PSR_MASK: MAX_SLEEP | LPSP | MEMUP | HPD
+ g15PsrW(0x60814,g15PsrR(0x60814)|7U);g15PsrW(0x60818,7U); // sem interrupcoes do PSR; limpa as pendentes
+ if(mode&2){const uint32_t pm=g15PsrR(0x70030);if(pm!=~0U && !(pm&0x00100000U)){g15PsrPm=1;g15PsrW(0x70030,pm|0x00100000U);}}
+ uint32_t idle=(mode>>8)&0xF;if(!idle)idle=6;
+ uint32_t v=(ctl&0x20000000U)|0x80000000U|(0x1FU<<20)|(1U<<10)|(2U<<8)|(3U<<6)|(2U<<4)|idle;
+ if(lanes&0x40)v|=1U<<11; // TP1 + TP3
+ if(standby)v|=1U<<27;
+ if(mode&16)v|=1U<<12;
+ g15PsrW(0x60800,v);
+ g15PsrOn=1;g15PsrArms++;
+ // (12/11) So com o DMC do ADL-S carregado (debug.g15dmc=1): com o da Apple o pipe perde o estado ao sair do DC5 (panic).
+ if((mode&4) && g15DcBase && g15DcSpin && g15DcCall && g15DcHooks==3 && !g15DcBad && g15DcRd(0x80000)==g15AdlsDmc[0]) { // DC por software
+  g15DcState=(mode&32)?1:2;g15DcLast=mach_absolute_time();g15DcArmed=1;g15DcSchedule(300);
+ }
+ if(gen!=g15PsrGen){g15PsrFail=6;g15PsrSourceOff(7);}
+}
+static void g15PsrReport(const char *why) {
+ SYSLOG("igfx","G15PSR %s modo=0x%x ligado=%u dc=%u falha=%u caps=%02x/%02x edp=%02x CTL=%08x",why,g15PsrMode,g15PsrOn,g15DcOn,
+  g15PsrFail,g15PsrCaps[0],g15PsrCaps[1],g15PsrCaps[2],(g15Psr.ctl && g15Psr.rd)?g15PsrR(0x60800):0);
+}
+static void g15PsrTimer(thread_call_param_t,thread_call_param_t) {
+ IOLockLock(g15PsrLock);g15PsrArmLocked();IOLockUnlock(g15PsrLock);
+ g15PsrReport("armar");
+}
+static void g15PsrCapture(void *ctl,void *port,mach_vm_address_t rd,mach_vm_address_t wr,mach_vm_address_t auxRd,
+ mach_vm_address_t auxWr,mach_vm_address_t dcOn,mach_vm_address_t dcOff) {
+ if(!g15PsrLock || !g15PsrCall)return;
+ { // MMIO direto para o DC por software: base em acesso+0x50 (WriteRegister32 da Apple); so vale se conferir
+  auto acc=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(ctl)+0xC40);
+  auto base=acc?*reinterpret_cast<volatile uint8_t **>(acc+0x50):nullptr;
+  const auto rdf=reinterpret_cast<uint32_t (*)(void *,unsigned long)>(rd);
+  if(base && rd && *reinterpret_cast<volatile uint32_t *>(base+0x70008)==rdf(acc,0x70008) &&
+     *reinterpret_cast<volatile uint32_t *>(base+0x6000C)==rdf(acc,0x6000C) && rdf(acc,0x6000C) && rdf(acc,0x6000C)!=~0U)g15DcBase=base;
+ }
+ g15Psr.ctl=ctl;g15Psr.port=port;g15Psr.rd=rd;g15Psr.wr=wr;g15Psr.auxRd=auxRd;g15Psr.auxWr=auxWr;g15Psr.dcOn=dcOn;g15Psr.dcOff=dcOff;
+ if(!(g15PsrMode&1))return;
+ uint64_t dl;clock_interval_to_deadline(3000,1000000,&dl);thread_call_enter_delayed(g15PsrCall,dl);
+}
+static int g15PsrSysctlMode SYSCTL_HANDLER_ARGS {
+ (void)arg1;(void)arg2;
+ int v=static_cast<int>(g15PsrMode);
+ const int e=sysctl_handle_int(oidp,&v,0,req);
+ if(e || !req->newptr)return e;
+ thread_call_cancel(g15PsrCall);if(g15DcCall)thread_call_cancel(g15DcCall);
+ IOLockLock(g15PsrLock);
+ g15PsrSourceOff(6);
+ const bool ready=g15Psr.ctl && g15Psr.port && g15Psr.rd && g15Psr.wr && g15Psr.auxWr;
+ if(ready && g15PsrPanelOn()){uint8_t z=0;g15PsrAux(true,0x170,&z,1);}
+ g15PsrMode=static_cast<uint32_t>(v);
+ g15PsrArmLocked();
+ IOLockUnlock(g15PsrLock);
+ g15PsrReport("sysctl");
+ return 0;
+}
+static int g15PsrSysctlInfo SYSCTL_HANDLER_ARGS {
+ (void)arg1;(void)arg2;(void)oidp;
+ char buf[900];int n;
+ IOLockLock(g15PsrLock);
+ if(!g15Psr.ctl || !g15Psr.rd)n=snprintf(buf,sizeof(buf),"modo=0x%x sem controlador (falta um modeset do eDP)",g15PsrMode);
+ else {
+  static const uint32_t regs[]={0x60800,0x60840,0x60844,0x60818,0x60860,0x60900,0x70030,0x70008,0x45504,0x101084,0x101088,
+   0x8F074,0x80000,0x45444,0x44404,0x4440C,0x46070};
+  uint32_t r[arrsize(regs)];
+  for(unsigned k=0;k<arrsize(regs);++k)r[k]=g15PsrR(regs[k]);
+  auto c=static_cast<uint8_t *>(g15Psr.ctl);
+  n=snprintf(buf,sizeof(buf),"modo=0x%x on=%u dc=%u falha=%u arms=%u offs=%u/%u/%u/%u/%u/%u/%u caps=%02x/%02x edp=%02x CTL=%08x "
+   "ST=%08x PERF=%08x IIR=%08x MASK=%08x PSR2=%08x PIPEMISC=%08x TRANSCONF=%08x DC=%08x dc5=%u dc6=%u DMC=%08x/%08x "
+   "AUXPW=%08x DEIMR=%08x DEIER=%08x CDPLL=%08x b48=%u c24=%d",g15PsrMode,g15PsrOn,g15DcOn,g15PsrFail,g15PsrArms,
+   g15PsrOffs[1],g15PsrOffs[2],g15PsrOffs[3],g15PsrOffs[4],g15PsrOffs[5],g15PsrOffs[6],g15PsrOffs[7],g15PsrCaps[0],
+   g15PsrCaps[1],g15PsrCaps[2],r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7],r[8],r[9],r[10],r[11],r[12],r[13],r[14],r[15],r[16],
+   *reinterpret_cast<uint32_t *>(c+0xB48),*reinterpret_cast<int32_t *>(c+0xC24));
+ }
+ if(n>0 && n<static_cast<int>(sizeof(buf))-260)n+=snprintf(buf+n,sizeof(buf)-n," | dcsw arm=%u on=%u bad=%u st=%u ganchos=%u base=%u "
+  "blocks=%u allows=%u mis=%u [%x:%08x>%08x %x:%08x>%08x] espera=%u dmc=%d p0=%08x",g15DcArmed,g15DcOn,g15DcBad,g15DcState,g15DcHooks,
+  g15DcBase!=nullptr,g15DcBlocks,g15DcAllows,g15DcMis,g15DcMisLog[0],g15DcMisLog[1],g15DcMisLog[2],g15DcMisLog[3],g15DcMisLog[4],
+  g15DcMisLog[5],g15DcWaitMax,g15DmcResult,g15DcBase?g15DcRd(0x80000):0);
+ IOLockUnlock(g15PsrLock);
+ if(n<0)n=0;if(n>=static_cast<int>(sizeof(buf)))n=sizeof(buf)-1;
+ return SYSCTL_OUT(req,buf,n+1);
+}
+static int g15PsrSysctlSink SYSCTL_HANDLER_ARGS {
+ (void)arg1;(void)arg2;(void)oidp;
+ char buf[160];int n;
+ IOLockLock(g15PsrLock);
+ if(!g15Psr.ctl || !g15Psr.port || !g15Psr.rd || !g15Psr.wr || !g15Psr.auxRd || !g15PsrPanelOn())
+  n=snprintf(buf,sizeof(buf),"sem painel ativo");
+ else {
+  uint8_t a[2]={},rev=0,cfg=0,err=0,st=0,lanes=0,ls[4]={};
+  const bool ok=g15PsrAux(false,0x70,a,2);g15PsrAux(false,0x202,ls,4);
+  g15PsrAux(false,0x700,&rev,1);g15PsrAux(false,0x170,&cfg,1);g15PsrAux(false,0x2006,&err,1);g15PsrAux(false,0x2008,&st,1);
+  g15PsrAux(false,0x2,&lanes,1);
+  n=snprintf(buf,sizeof(buf),"aux=%u psr_cap=%02x/%02x edp_rev=%02x cfg170=%02x err2006=%02x st2008=%02x lanes02=%02x "
+   "link202=%02x/%02x/%02x/%02x",ok,a[0],a[1],rev,cfg,err,st,lanes,ls[0],ls[1],ls[2],ls[3]);
+ }
+ IOLockUnlock(g15PsrLock);
+ if(n<0)n=0;if(n>=static_cast<int>(sizeof(buf)))n=sizeof(buf)-1;
+ return SYSCTL_OUT(req,buf,n+1);
+}
+static int g15PsrSysctlReg SYSCTL_HANDLER_ARGS {
+ (void)arg1;(void)arg2;(void)oidp;
+ if(req->newptr) {
+  int a=0;const int e=SYSCTL_IN(req,&a,sizeof(a));if(e)return e;
+  if(a>=0 && a<0x200000 && !(a&3))g15PsrPeek=static_cast<uint32_t>(a);
+ }
+ int v=(g15Psr.ctl && g15Psr.rd)?static_cast<int>(g15PsrR(g15PsrPeek)):-1;
+ return SYSCTL_OUT(req,&v,sizeof(v));
+}
+// debug.g15dpcd=<endereco> escolhe; a leitura devolve 4 bytes do DPCD (-1 = AUX falhou).
+static int g15PsrSysctlDpcd SYSCTL_HANDLER_ARGS {
+ (void)arg1;(void)arg2;(void)oidp;
+ if(req->newptr) {
+  int a=0;const int e=SYSCTL_IN(req,&a,sizeof(a));if(e)return e;
+  if(a>=0 && a<0x100000)g15PsrDpcd=static_cast<uint32_t>(a);
+  return 0;
+ }
+ int v=-1;
+ IOLockLock(g15PsrLock);
+ if(g15Psr.ctl && g15Psr.port && g15Psr.rd && g15Psr.wr && g15Psr.auxRd && g15PsrPanelOn()) {
+  uint8_t b[4]={};
+  if(g15PsrAux(false,g15PsrDpcd,b,4))v=static_cast<int>(b[0]|(b[1]<<8)|(b[2]<<16)|(uint32_t(b[3])<<24));
+ }
+ IOLockUnlock(g15PsrLock);
+ return SYSCTL_OUT(req,&v,sizeof(v));
+}
+SYSCTL_PROC(_debug,OID_AUTO,g15dpcd,CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY|CTLFLAG_LOCKED,nullptr,0,g15PsrSysctlDpcd,"I","");
+// debug.g15dmc=1 carrega o DMC do ADL-S (PSR desligado); a leitura devolve a 1a palavra do programa em 0x80000.
+static int g15PsrSysctlDmc SYSCTL_HANDLER_ARGS {
+ (void)arg1;(void)arg2;(void)oidp;
+ if(req->newptr) {
+  int a=0;const int e=SYSCTL_IN(req,&a,sizeof(a));if(e)return e;
+  if(a==1 && g15DcSpin) {
+   IOLockLock(g15PsrLock);
+   const IOInterruptState is=IOSimpleLockLockDisableInterrupt(g15DcSpin);
+   g15DmcResult=g15DmcLoad();
+   IOSimpleLockUnlockEnableInterrupt(g15DcSpin,is);
+   IOLockUnlock(g15PsrLock);
+  }
+  return 0;
+ }
+ int v=g15DcBase?static_cast<int>(g15DcRd(0x80000)):-1;
+ return SYSCTL_OUT(req,&v,sizeof(v));
+}
+SYSCTL_PROC(_debug,OID_AUTO,g15dmc,CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY|CTLFLAG_LOCKED,nullptr,0,g15PsrSysctlDmc,"I","");
+SYSCTL_PROC(_debug,OID_AUTO,g15psr,CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY|CTLFLAG_LOCKED,nullptr,0,g15PsrSysctlMode,"I","");
+SYSCTL_PROC(_debug,OID_AUTO,g15psr_info,CTLTYPE_STRING|CTLFLAG_RD|CTLFLAG_LOCKED,nullptr,0,g15PsrSysctlInfo,"A","");
+SYSCTL_PROC(_debug,OID_AUTO,g15psr_sink,CTLTYPE_STRING|CTLFLAG_RD|CTLFLAG_LOCKED,nullptr,0,g15PsrSysctlSink,"A","");
+SYSCTL_PROC(_debug,OID_AUTO,g15reg,CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY|CTLFLAG_LOCKED,nullptr,0,g15PsrSysctlReg,"I","");
+static void g15PsrInit(uint32_t mode) {
+ if(g15PsrLock)return;
+ auto lock=IOLockAlloc();g15PsrCall=thread_call_allocate(g15PsrTimer,nullptr);
+ if(!lock || !g15PsrCall)return;
+ g15DcSpin=IOSimpleLockAlloc();g15DcCall=thread_call_allocate(g15DcTimer,nullptr);
+ g15PsrMode=mode;g15PsrLock=lock;
+ sysctl_register_oid(&sysctl__debug_g15dmc);
+ sysctl_register_oid(&sysctl__debug_g15psr);sysctl_register_oid(&sysctl__debug_g15psr_info);
+ sysctl_register_oid(&sysctl__debug_g15psr_sink);sysctl_register_oid(&sysctl__debug_g15reg);sysctl_register_oid(&sysctl__debug_g15dpcd);
+ SYSLOG("igfx","G15PSR pronto modo=0x%x",mode);
 }
 
 // Native DPCD records exclude EDID transactions, which otherwise exhaust the
@@ -13511,6 +13867,9 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
     // hwSetPanelPower(1) da Apple antes do hwSetMode.
     {
      adlsPanelPowerFn=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController15hwSetPanelPowerEj",address,size);
+     adlsDC6On=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController11enableHWDC6Ev",address,size);
+     adlsDC6Off=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController12disableHWDC6Ev",address,size);
+     g15PsrBoot(patcher,index,address,size,orgTGLFastRegisterWrite!=0); // G15 PSR: so com o boot-arg wexg15psr
      patcher.clearError();
      bool smReady=adlsPanelPowerFn && orgTGLRegisterRead;
      if(smReady) {
@@ -15107,17 +15466,21 @@ void XE::wrapTGLHostIRQEnable(void *bridge) {
  tglFBIRQEnd(r,0);
 }
 
+static volatile uint64_t g15SWIrqN=0,g15HWIrqN=0; // G15 (11/11): batimentos do caminho de interrupcao da GT
 void XE::wrapTGLHostIRQProcess(void *bridge) {
+ ++g15HWIrqN;
  auto r=tglHostIRQBegin(0,bridge,0,0,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
  FunctionCast(wrapTGLHostIRQProcess,callbackXE->orgTGLHostIRQProcess)(bridge);
  tglHostIRQEnd(r);
 }
 void XE::wrapTGLHostIRQService(void *bridge,const uint64_t *bits) {
+ ++g15HWIrqN;
  auto r=tglHostIRQBegin(1,bridge,bits ? *bits : 0,0,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
  FunctionCast(wrapTGLHostIRQService,callbackXE->orgTGLHostIRQService)(bridge,bits);
  tglHostIRQEnd(r);
 }
 void XE::wrapTGLHostSWInterrupt(void *streamer,void *source,int count) {
+ ++g15SWIrqN;
  auto r=tglHostIRQBegin(2,streamer,reinterpret_cast<uintptr_t>(source),count,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
  FunctionCast(wrapTGLHostSWInterrupt,callbackXE->orgTGLHostSWInterrupt)(streamer,source,count);
  tglHostIRQEnd(r);
@@ -15283,8 +15646,27 @@ static uint32_t g15ActiveIdx[6][5];
 static volatile uint64_t g15WillSleepN=0,g15DidWakeN=0,g15ResetWakeN=0,g15WillSleepT=0,g15DidWakeT=0,g15ResetWakeT=0,g15CSBSinceSleep=0,g15CSBSinceReset=0;
 static void g15SnapAll(unsigned phase);
 static void g15SaveActive();
+static mach_vm_address_t g15OrgCheckProgress=0;static uint32_t g15UnstickMask=0;
+static bool g15WrapCheckProgress(void *schedObj,uint32_t cs);
+static void g15HangSysctlRegister();
+// G15 (12/11): energia de render durante TODA a execucao no RCS. O 1o hang da UHD com registro (07:31:59) mostrou o ultimo
+// envio (S) sem nenhum evento de CSB depois: o hardware nunca carregou a lista (CSB parado, anel ocioso, "pode enviar" = 0
+// para sempre). O envio so segurava o forcewake de render em volta da escrita (solto logo depois) e os hangs comecaram em
+// 10/11 ~20:00, na hora em que o RC6 voltou (injetor do AGPM). Como o i915 (forcewake enquanto houver pedido em voo): o
+// 1o envio fica com a referencia e ela so e solta no ActiveToIdle com as listas vazias, no repouso ou num reset.
+// -wex-g15-execwake-off volta ao comportamento antigo. Contadores no G15-sched global (execwake=segura/pegou/soltou).
+static volatile uint32_t g15ExecWake=0;static int g15ExecWakeOff=-1;static uint8_t *g15ExecWakeOwner=nullptr;
+static uint64_t g15ExecWakeTakes=0,g15ExecWakeRels=0;
+static mach_vm_address_t g15HostSubmitOrg=0;static uint32_t g15LastSubmitFlags[6]={};
+static void g15ExecWakeRelease() {
+ if(!__sync_bool_compare_and_swap(&g15ExecWake,1,0))return;
+ if(g15ExecWakeOwner)tglCSBForceWake[0](g15ExecWakeOwner,false,1);
+ ++g15ExecWakeRels;
+}
 static uint64_t g15WrapWillSleep(void *acc) {
  g15WillSleepN++;g15WillSleepT=mach_absolute_time();g15CSBSinceSleep=0;
+ g15PsrLeave(3);
+ g15ExecWakeRelease();
  g15SnapAll(0);
  // Marca so depois do original: ele ainda espera a GPU ficar ociosa (eventos de conclusao precisam passar).
  const auto r=reinterpret_cast<uint64_t (*)(void *)>(g15OrgWillSleep)(acc);
@@ -15344,6 +15726,13 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   };
   const bool g15ok=patcher.routeMultiple(index,g15routes,2,address,size);patcher.clearError();
   IORegistryEntry::getRegistryRoot()->setProperty("G15SleepTraceReady",g15ok);
+  // G15 (11/11): estado do escalonador quando o IOAccel acusa falta de progresso (antes do reset) e destravamentos
+  // candidatos por mascara (boot-arg wexg15unstick; 0 = so registra). Ver g15WrapCheckProgress.
+  KernelPatcher::RouteRequest g15p[] {{"__ZN12IGScheduler516checkForProgressE10IGHwCsType",g15WrapCheckProgress,g15OrgCheckProgress}};
+  const bool pok=patcher.routeMultiple(index,g15p,1,address,size);patcher.clearError();
+  PE_parse_boot_argn("wexg15unstick",&g15UnstickMask,sizeof(g15UnstickMask));
+  uint32_t pv[2]={pok,g15UnstickMask};IORegistryEntry::getRegistryRoot()->setProperty("G15Progress",pv,sizeof(pv));
+  g15HangSysctlRegister();
  }
  KernelPatcher::RouteRequest routes[] {
   {"__ZN26IGHardwareCommandStreamer54initEP22IOGraphicsAccelerator2P10IOWorkLoopP12IGScheduler510IGHwCsType",wrapTGLCSBInit,orgTGLCSBInit},
@@ -15503,7 +15892,200 @@ void XE::wrapTGLCSBWake(void *streamer) {
 // So leitura (MMIO com forcewake, como o proprio reset). `log show --predicate 'eventMessage CONTAINS "G15-gpureset"'`.
 static uint64_t g15LastCSBT[6];
 static uint32_t g15ResetLogN=0;
+
+// G15 (11/11, 2a etapa): o desmonte do AppleIntelTGLGraphics mostra que o despacho (schedDispatch) so anda se
+//  - o motor nao esta em pausa (streamer+0x1C00; IGScheduler5::pause so e chamado no tratamento do hang);
+//  - "pode enviar" (streamer+0x1C3C) = 1: zerado no submitExecList, religado so pelo evento IdleToActive/Preempted;
+//  - a guarda de reentrada (streamer+0x1C38) esta livre; e a prioridade nao esta em pausa termica
+//    (IGScheduler5+0x5E4+i*0x180, desfeita so por temporizador; atributo termico em +0xA90..0xA9C);
+//  e que tudo roda no workloop (a fonte streamer+0x58). O checkForProgress chuta essa fonte por ~2,5 s antes do reset.
+// Registra tudo isso na entrada e na saida do checkForProgress (G15-sched/G15-hist/G15-progress), com os ultimos
+// eventos de cada motor (S = submitExecList, C = evento do CSB, D = evento descartado).
+// G15 (11/11 23h): o IOLog de kext injetado pelo OpenCore NAO chega ao log persistente (so ao dmesg, que se perde no
+// reinicio): o hang das 22:34 nao deixou nenhuma linha G15-. Tudo passa a ir tambem para um buffer de texto, gravado
+// em /private/var/log/g15-uhd-hang-<epoch>.txt (FileIO do Lilu) a cada checkForProgress e nos primeiros resets.
+static char g15LogBuf[256*1024];static volatile uint32_t g15LogLen=0;static char g15LogPath[80];static int g15LogFlushRc=-999;
+static void g15Logf(const char *fmt,...) __printflike(1,2);
+static void g15Logf(const char *fmt,...) {
+ char line[720];va_list ap;va_start(ap,fmt);int n=vsnprintf(line,sizeof(line),fmt,ap);va_end(ap);
+ if(n<=0)return;if(static_cast<size_t>(n)>=sizeof(line)){n=sizeof(line)-1;line[n-1]='\n';}
+ IOLog("%s",line);
+ const uint32_t off=__sync_fetch_and_add(&g15LogLen,static_cast<uint32_t>(n));
+ if(off<sizeof(g15LogBuf) && sizeof(g15LogBuf)-off>=static_cast<uint32_t>(n))memcpy(g15LogBuf+off,line,n);
+ else __sync_fetch_and_sub(&g15LogLen,static_cast<uint32_t>(n));
+}
+static void g15LogFlush() {
+ uint32_t len=g15LogLen;if(len>sizeof(g15LogBuf))len=sizeof(g15LogBuf);if(!len)return;
+ if(!g15LogPath[0]) {
+  clock_sec_t sec=0;clock_usec_t usec=0;clock_get_calendar_microtime(&sec,&usec);
+  snprintf(g15LogPath,sizeof(g15LogPath),"/private/var/log/g15-uhd-hang-%lu.txt",static_cast<unsigned long>(sec));
+ }
+ static volatile uint32_t busy=0;if(!__sync_bool_compare_and_swap(&busy,0,1))return;
+ g15LogFlushRc=FileIO::writeBufferToFile(g15LogPath,g15LogBuf,len);busy=0;
+}
+struct G15Ev {uint64_t t,raw;uint8_t type,handler,actB,actA,canB,canA;};
+static G15Ev g15Hist[6][32];static volatile uint32_t g15HistN[6];
+static volatile uint64_t g15CSBTotal=0;
+static uint32_t g15HistAdd(unsigned e,uint8_t type,uint64_t raw,uint8_t handler,const uint8_t *st) {
+ if(e>=6)return 0;const uint32_t i=__sync_fetch_and_add(&g15HistN[e],1)&31;auto &h=g15Hist[e][i];
+ h.t=mach_absolute_time();h.raw=raw;h.type=type;h.handler=handler;
+ h.actB=h.actA=static_cast<uint8_t>(*reinterpret_cast<const uint32_t *>(st+0x50));h.canB=h.canA=st[0x1C3C];return i;
+}
+static void g15HistDone(unsigned e,uint32_t i,const uint8_t *st,uint8_t type=0) {
+ if(e>=6)return;auto &h=g15Hist[e][i&31];if(type)h.type=type;
+ h.actA=static_cast<uint8_t>(*reinterpret_cast<const uint32_t *>(st+0x50));h.canA=st[0x1C3C];
+}
+static void g15LogHist(const char *tag,uint32_t n) {
+ for(unsigned e=0;e<6;++e) {
+  const uint32_t total=g15HistN[e];if(!total)continue;
+  const uint32_t count=total<24?total:24;
+  for(uint32_t k=0;k<count;k+=6) {
+   char line[420];size_t used=0;line[0]=0;
+   for(uint32_t j=k;j<count && j<k+6;++j) {
+    const auto &h=g15Hist[e][(total-count+j)&31];
+    const int w=snprintf(line+used,sizeof(line)-used,"%c%llu:%llx/%u/%u>%u/%u>%u ",h.type,g15Since(h.t)/1000,h.raw,
+     h.handler,h.actB,h.actA,h.canB,h.canA);
+    if(w<0 || static_cast<size_t>(w)>=sizeof(line)-used)break;used+=w;
+   }
+   g15Logf("G15-hist %s #%u e=%u %u/%u (tipo ms:raw/handler/ativo>ativo/pode>pode): %s\n",tag,n,e,k,total,line);
+  }
+ }
+}
+static void g15LogSched(const char *tag,uint32_t n,uint32_t cs) {
+ uint8_t *sched=nullptr,*owner=nullptr;volatile uint8_t *bar=nullptr;
+ for(unsigned e=0;e<arrsize(tglCSBEngines);++e) {
+  auto &eng=tglCSBEngines[e];
+  if(!eng.streamer || !eng.hardwareReady)continue;
+  TGLCSBIO io(eng.streamer,0);io.acquire();
+  auto st=io.streamer;sched=*reinterpret_cast<uint8_t **>(st+0x20);owner=io.owner;bar=io.bar;
+  const uint32_t base=io.pointerReg-0x3A0;
+  auto rd=[&](uint32_t r){return *reinterpret_cast<volatile uint32_t *>(io.bar+r);};
+  const uint32_t hwsTail=*reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC),head=eng.state.head;
+  const uint32_t pend=(hwsTail<TGLCSB::Capacity && head<TGLCSB::Capacity)?(hwsTail+TGLCSB::Capacity-head)%TGLCSB::Capacity:99;
+  uint32_t ids[4];
+  for(unsigned i=0;i<4;++i) {
+   void *item=*reinterpret_cast<void **>(st+0x30+i*8);
+   auto ctx=item?*reinterpret_cast<uint8_t **>(item):nullptr;
+   ids[i]=!item?0:ctx?*reinterpret_cast<uint32_t *>(ctx+0x7C):0xFFFFFFFF;
+  }
+  const uint64_t since=g15LastCSBT[e]?g15Since(g15LastCSBT[e])/1000:UINT64_MAX;
+  g15Logf("G15-sched %s #%u cs=%u e=%u pausa=%u guarda=%u pode=%u prog=%u act=%u el0=%x,%x el1=%x,%x pend=%u head=%u hwsTail=%u "
+   "ptr=%x anel=%x/%x exl=%x:%x csbMs=%llu consumed=%llu sq=%x:%x ctl=%x\n",tag,n,cs,e,st[0x1C00],*reinterpret_cast<uint32_t *>(st+0x1C38),st[0x1C3C],
+   *reinterpret_cast<uint32_t *>(st+0x1C40),*reinterpret_cast<uint32_t *>(st+0x50),ids[0],ids[1],ids[2],ids[3],pend,head,hwsTail,
+   rd(io.pointerReg),rd(base+0x34),rd(base+0x30),rd(base+0x234),rd(base+0x238),since,eng.consumed,rd(base+0x510),rd(base+0x514),
+   rd(base+0x550));
+ }
+ if(!sched || !owner || !bar)return;
+ auto rd=[&](uint32_t r){return *reinterpret_cast<volatile uint32_t *>(bar+r);};
+ auto s32=[&](uint32_t o){return *reinterpret_cast<uint32_t *>(sched+o);};
+ uint64_t flags;memcpy(&flags,owner+0x1190,sizeof(flags));
+ g15Logf("G15-sched %s #%u global pausa=%u termico=%u,%u,%u,%u teto=%u freio=%u,%u,%u,%u atraso=%u,%u,%u,%u idle=%x dpsm=%x flags=%llx "
+  "mst=%x dw=%x,%x ier=%x imr=%x,%x fw=%x,%x swirq=%llu hwirq=%llu csb=%llu asleep=%x fwreq=%x execwake=%u/%llu/%llu\n",tag,n,sched[0xA88],
+  s32(0xA90),s32(0xA94),s32(0xA98),s32(0xA9C),s32(0xA8C),sched[0x5E4],sched[0x764],sched[0x8E4],sched[0xA64],
+  s32(0x5E0),s32(0x760),s32(0x8E0),s32(0xA60),s32(0xCD0),*reinterpret_cast<uint32_t *>(owner+0x1458),flags,
+  rd(0x190010),rd(0x190018),rd(0x19001C),rd(0x190030),rd(0x190090),rd(0x1900A0),rd(0xD84),rd(0x130044),
+  g15SWIrqN,g15HWIrqN,g15CSBTotal,(unsigned)g15GpuAsleep,rd(0xA278),g15ExecWake,g15ExecWakeTakes,g15ExecWakeRels);
+ g15LogHist(tag,n);
+}
+static bool g15Progressed(const uint8_t *st,uint32_t from,unsigned ms) {
+ for(unsigned i=0;i<=ms/10;++i) {
+  if(static_cast<int32_t>(*reinterpret_cast<const volatile uint32_t *>(st+0x1C40)-from)>0)return true;
+  IOSleep(10);
+ }
+ return false;
+}
+static void g15KickAll() {
+ for(auto &eng:tglCSBEngines) {
+  auto st=static_cast<uint8_t *>(eng.streamer);if(!st || !eng.hardwareReady || st[0x1C00])continue;
+  auto src=*reinterpret_cast<IOInterruptEventSource **>(st+0x58);if(src)src->interruptOccurred(nullptr,nullptr,0);
+ }
+}
+// Passo 4 do destravamento, no workloop do motor: repete o envio nativo da lista pendente com o forcewake seguro.
+static IOReturn g15ResubmitAction(OSObject *,void *st,void *fl,void *,void *) {
+ auto x=static_cast<uint8_t *>(st);
+ TGLCSBIO io(x,0);io.acquire();
+ if(io.engine==0 && !g15ExecWakeOff && io.owner && __sync_bool_compare_and_swap(&g15ExecWake,0,1)) {
+  tglCSBForceWake[0](io.owner,true,1);g15ExecWakeOwner=io.owner;++g15ExecWakeTakes;
+ }
+ reinterpret_cast<void (*)(void *,uint32_t)>(g15HostSubmitOrg)(st,static_cast<uint32_t>(reinterpret_cast<uintptr_t>(fl)));
+ return kIOReturnSuccess;
+}
+// Destravamentos candidatos (wexg15unstick=mascara), so quando o original desistiu (ia reiniciar a GPU). Em ordem:
+//  bit0 desfaz a pausa termica; bit1 desfaz pausa esquecida; bit2 religa "pode enviar" com o anel ocioso;
+//  bit3 solta a guarda de reentrada; bit4 (12/11) reenvia a lista quando o ultimo evento do motor e um envio sem resposta
+//  ha mais de 2 s. Cada passo chuta o despacho e espera 400 ms por progresso; o que funcionar fica
+//  no log (G15-unstick) e o reset e evitado.
+static bool g15WrapCheckProgress(void *schedObj,uint32_t cs) {
+ static volatile uint32_t calls=0;const uint32_t n=__sync_add_and_fetch(&calls,1);
+ const uint64_t sw0=g15SWIrqN,hw0=g15HWIrqN,csb0=g15CSBTotal;const bool log=n<=48;
+ if(log)g15LogSched("antes",n,cs);
+ const bool ok=reinterpret_cast<bool (*)(void *,uint32_t)>(g15OrgCheckProgress)(schedObj,cs);
+ {
+  clock_sec_t sec=0;clock_usec_t usec=0;clock_get_calendar_microtime(&sec,&usec);
+  g15Logf("G15-progress #%u cs=%u progresso=%u swirq+%llu hwirq+%llu csb+%llu mascara=%x epoch=%lu\n",n,cs,ok,g15SWIrqN-sw0,
+   g15HWIrqN-hw0,g15CSBTotal-csb0,g15UnstickMask,static_cast<unsigned long>(sec));
+ }
+ if(log)g15LogFlush();
+ if(ok || !log)return ok;
+ g15LogSched("depois",n,cs);
+ auto s=static_cast<uint8_t *>(schedObj);
+ auto st=(cs&0xFF)<6?*reinterpret_cast<uint8_t **>(s+0xCA0+(cs&0xFF)*8):nullptr;
+ if(!g15UnstickMask || !st){g15LogFlush();return ok;}
+ for(unsigned step=0;step<5;++step) {
+  if(!(g15UnstickMask&(1U<<step)))continue;
+  uint32_t applied=0;const uint32_t from=*reinterpret_cast<volatile uint32_t *>(st+0x1C40);
+  if(step==0) {
+   for(unsigned i=0;i<4;++i)if(s[0x5E4+i*0x180]){s[0x5E4+i*0x180]=0;applied|=1U<<i;}
+  } else if(step==1) {
+   if(s[0xA88]){s[0xA88]=0;applied|=0x80;}
+   for(unsigned e=0;e<6;++e){auto x=static_cast<uint8_t *>(tglCSBEngines[e].streamer);if(x && x[0x1C00]){x[0x1C00]=0;applied|=1U<<e;}}
+  } else if(step==2) {
+   for(unsigned e=0;e<6;++e) {
+    auto x=static_cast<uint8_t *>(tglCSBEngines[e].streamer);
+    if(!x || !tglCSBEngines[e].hardwareReady || x[0x1C3C])continue;
+    TGLCSBIO io(x,0);io.acquire();const uint32_t base=io.pointerReg-0x3A0;
+    const uint32_t h=*reinterpret_cast<volatile uint32_t *>(io.bar+base+0x34)&0x1FFFFC,t=*reinterpret_cast<volatile uint32_t *>(io.bar+base+0x30)&0x1FFFF8;
+    if(h==t){x[0x1C3C]=1;applied|=1U<<e;}
+   }
+  } else if(step==3) {
+   for(unsigned e=0;e<6;++e){auto x=static_cast<uint8_t *>(tglCSBEngines[e].streamer);
+    if(x && *reinterpret_cast<volatile uint32_t *>(x+0x1C38)){*reinterpret_cast<volatile uint32_t *>(x+0x1C38)=0;applied|=1U<<e;}}
+  } else {
+   for(unsigned e=0;e<6;++e) {
+    auto x=static_cast<uint8_t *>(tglCSBEngines[e].streamer);
+    if(!x || !tglCSBEngines[e].hardwareReady || !g15HostSubmitOrg || !g15HistN[e])continue;
+    const auto &h=g15Hist[e][(g15HistN[e]-1)&31];
+    bool pending=false;
+    for(unsigned i=0;i<4;++i)if(*reinterpret_cast<void **>(x+0x30+i*8))pending=true;
+    if(h.type!='S' || !pending || g15Since(h.t)<2000000ULL)continue;
+    auto src=*reinterpret_cast<IOInterruptEventSource **>(x+0x58);auto wl=src?src->getWorkLoop():nullptr;
+    if(!wl)continue;
+    wl->runAction(g15ResubmitAction,src,x,reinterpret_cast<void *>(static_cast<uintptr_t>(g15LastSubmitFlags[e])));
+    applied|=1U<<e;
+   }
+  }
+  bool won=false;
+  if(applied){g15KickAll();won=g15Progressed(st,from,400);}
+  g15Logf("G15-unstick #%u passo=%u aplicado=%x progresso=%u\n",n,step,applied,won);
+  if(won){g15LogSched("destravado",n,cs);g15LogFlush();return true;}
+ }
+ g15LogFlush();return ok;
+}
+// Teste do canal sem esperar um hang (sem sudo): `sysctl debug.g15hang=1` registra o estado atual (G15-sched manual) e
+// grava o arquivo; `sysctl debug.g15hang` devolve o codigo da ultima gravacao (0 = gravou, -999 = nunca tentou).
+static int g15HangSysctl SYSCTL_HANDLER_ARGS {
+ int v=g15LogFlushRc;const int e=sysctl_handle_int(oidp,&v,0,req);
+ if(e || !req->newptr)return e;
+ static volatile uint32_t manual=0;const uint32_t n=__sync_add_and_fetch(&manual,1);
+ if(n<=8){g15LogSched("manual",n,0);g15LogFlush();}
+ return 0;
+}
+SYSCTL_PROC(_debug,OID_AUTO,g15hang,CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY|CTLFLAG_LOCKED,nullptr,0,g15HangSysctl,"I","");
+static void g15HangSysctlRegister() {
+ static bool done=false;if(done)return;done=true;sysctl_register_oid(&sysctl__debug_g15hang);
+}
 static void g15LogResetState(void *resetStreamer) {
+ g15ExecWakeRelease();
  const uint32_t n=++g15ResetLogN;
  unsigned resetEngine=UINT32_MAX;
  for(unsigned e=0;e<arrsize(tglCSBEngines);++e)if(tglCSBEngines[e].streamer==resetStreamer)resetEngine=e;
@@ -15525,19 +16107,19 @@ static void g15LogResetState(void *resetStreamer) {
    ids[i]=!item?0:ctx?*reinterpret_cast<uint32_t *>(ctx+0x7C):0xFFFFFFFF;
   }
   const uint64_t since=g15LastCSBT[e]?g15Since(g15LastCSBT[e])/1000:UINT64_MAX;
-  IOLog("G15-gpureset #%u e=%u(reset=%u) head=%u native=%u hwsTail=%u ptr=%x pend=%u next=%llx act=%u "
+  g15Logf("G15-gpureset #%u e=%u(reset=%u) head=%u native=%u hwsTail=%u ptr=%x pend=%u next=%llx act=%u "
    "el0=%x,%x el1=%x,%x csbMs=%llu consumed=%llu err=%u asleep=%x\n",
    n,e,resetEngine,head,native,hwsTail,ptr,pend,next,active,ids[0],ids[1],ids[2],ids[3],since,eng.consumed,
    static_cast<unsigned>(eng.state.error),(unsigned)g15GpuAsleep);
  }
 }
 void XE::wrapTGLCSBReset(void *streamer) {
- g15LogResetState(streamer);
+ g15LogResetState(streamer);g15LogHist("reset",g15ResetLogN);if(g15ResetLogN<=24)g15LogFlush();
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
- g15CSBSinceSleep++;g15CSBSinceReset++;
+ g15CSBSinceSleep++;g15CSBSinceReset++;g15CSBTotal++;
  // G15 (08/11): entre o systemWillSleep e o resetOnWake nao ha trabalho valido na GPU; os eventos que chegam (com a
  // pagina de status velha/invalida) derrubavam o despertar (r113). Descarta; o resetOnWake reinicializa o CSB.
  TGLCSBIO io(streamer,flags);
@@ -15577,6 +16159,7 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
    case TGLCSB::Handler::ActiveToIdle: handler=3;break;
    default: return false;
   }
+  const uint32_t g15h=g15HistAdd(io.engine,'C',sample.raw,static_cast<uint8_t>(handler),io.streamer);
   // G15 (08/11): nos primeiros 30 s depois do resetOnWake, o 1o evento de troca de contexto chegava sem item na lista
   // ativa (EL-null) ou com outro contexto (ID-mismatch) e o validador nativo dava panic. Pre-valida como o
   // ContextStatusBufferValidate da Apple (lista em streamer+0x30+ativo*16; item->contexto+0x7C == id do evento) e,
@@ -15608,7 +16191,7 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
     auto r=g15StaleLog[g15StaleN++];r[0]=handler;r[1]=active;r[2]=want;r[3]=idA;r[4]=idB;r[5]=fixed|(stale<<1);
     r[6]=entry.flags;r[7]=io.engine;
    }
-   if (stale) {g15CSBStale++;++engine.consumed;return true;}
+   if (stale) {g15CSBStale++;++engine.consumed;g15HistDone(io.engine,g15h,io.streamer,'D');return true;}
   }
   // Original validators still run inside handlers. No manufactured legacy
   // flags, forced bank promotion, or pretend completion for unsupported waits.
@@ -15627,6 +16210,12 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
    }
   }
   tglCSBMethods[handler](streamer,&entry);
+  g15HistDone(io.engine,g15h,io.streamer);
+  if(io.engine==0 && handler==3 && g15ExecWake) { // G15: RCS ocioso (nenhuma lista ativa nem pendente) -> solta o render
+   bool idle=true;
+   for(unsigned i=0;i<4;++i)if(*reinterpret_cast<void **>(io.streamer+0x30+i*8))idle=false;
+   if(idle)g15ExecWakeRelease();
+  }
   if (record) {
    // Existing fixed history: native return and resulting banks, no MMIO/wait.
    uint64_t banks[12];tglHostBanks(io.streamer,banks);
@@ -16423,7 +17012,12 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
    reinterpret_cast<uint64_t>(streamer),tglCSBEngines[0].resets,read,force);
  } else if(tglSameTailEnabled && streamer==tglCSBEngines[0].streamer)tglSameTailState.previous={};
  if(renderWakeOwner)tglSubmitHistoryRecord(renderWakeOwner,streamer,n,0);
+ unsigned g15e=6;for(unsigned i=0;i<6;++i)if(tglCSBEngines[i].streamer==streamer)g15e=i;
+ const uint32_t g15h=g15HistAdd(g15e,'S',flags,0,static_cast<uint8_t *>(streamer));
+ if(g15e<6)g15LastSubmitFlags[g15e]=flags;
+ g15HostSubmitOrg=callbackXE->orgTGLHostSubmit;
  FunctionCast(wrapTGLHostSubmit,callbackXE->orgTGLHostSubmit)(streamer,flags);
+ g15HistDone(g15e,g15h,static_cast<uint8_t *>(streamer));
  if(renderWakeOwner)tglSubmitHistoryRecord(renderWakeOwner,streamer,n,1);
  adlnQueueTraceSubmitFinish(queueTraceMask,renderWakeOwner);
  if(executionSlot!=UINT32_MAX) {
@@ -16444,7 +17038,11 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
   static uint32_t retained;
   const bool keep=checkKernelArgument("-wex-tgl-hold-render-wake") &&
    __atomic_exchange_n(&retained,1U,__ATOMIC_RELAXED)==0;
+  if(g15ExecWakeOff<0)g15ExecWakeOff=checkKernelArgument("-wex-g15-execwake-off");
+  // G15: o 1o envio com o RCS ocioso fica com a referencia ate o ActiveToIdle (ver g15ExecWake).
+  const bool g15keep=!keep && !g15ExecWakeOff && __sync_bool_compare_and_swap(&g15ExecWake,0,1);
   if (keep) IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderWakeLifetimeTrial",309,32);
+  else if (g15keep) {g15ExecWakeOwner=renderWakeOwner;++g15ExecWakeTakes;}
   else tglCSBForceWake[0](renderWakeOwner,false,1);
   if (n<arrsize(tglHost.submit)) tglHost.submit[n].q[114]=*reinterpret_cast<volatile uint32_t *>(renderWakeOwner+0x1290);
  }
@@ -17738,6 +18336,7 @@ uint32_t XE::wrapTGLTopDDC(void *fb, int connection, uint32_t block, uint32_t ty
 }
 
 uint32_t XE::wrapTGLRegisterRead(void *access, unsigned long reg) {
+ g15DcTouch(reg); // G15: DC por software
  if(comboClockAccess(access))reg=comboClockTransaction.translation.reg(reg,XELPComboClock::donorPC(callbackXE->framebufferClockImage,reinterpret_cast<uintptr_t>(__builtin_return_address(0))));
  const bool trace=tglTransitionRegister(reg);
  if(trace)tglTransitionRecord(35,false,access,reg,tglConnectionCaller(__builtin_return_address(0)),0);
@@ -19095,6 +19694,7 @@ uint32_t XE::wrapTGLLightUpDP(void *controller, void *fb, void *path, const void
 uint32_t XE::wrapTGLDisableDisplay(void *controller, void *fb, void *path, uint8_t flag) {
 	auto caller = __builtin_return_address(0);
 	tglObservePath(nullptr, path, 4, false, 0, flag, caller);
+	g15PsrLeave(2); // G15 PSR: sai antes de desligar a tela
 	auto s = callbackXE;
 	auto port = path ? *reinterpret_cast<void **>(static_cast<uint8_t *>(path) + 0x3648) : nullptr;
 	auto &tx = tglClockOffTransaction;
@@ -19357,6 +19957,7 @@ uint32_t XE::wrapADLSSetMode(void *controller,void *fb,void *path,const void *ti
     // 0xe00002bc) com a tela preta. Agora a energia do painel/AUX A e garantida em todo modeset do eDP do ADL-S.
     // rec[20] = modesets totais, rec[21] = repousos ate aqui. -wex-g15-setmode-sleeponly volta ao comportamento antigo.
     void *access=*reinterpret_cast<void **>(static_cast<uint8_t *>(controller)+0xC40);
+    g15PsrLeave(1); // G15 PSR: sai antes de qualquer modeset
     static int sleepOnly=-1;if(sleepOnly<0)sleepOnly=checkKernelArgument("-wex-g15-setmode-sleeponly");
     const bool after=(g15WillSleepN || !sleepOnly) && callbackXE->adlsDisplaySelected && callbackXE->adlsWiring.panel;
     if(after) {
@@ -19407,6 +20008,12 @@ uint32_t XE::wrapADLSSetMode(void *controller,void *fb,void *path,const void *ti
     uint32_t fbefore[13];
     if(callbackXE->adlsDisplaySelected)for(unsigned k=0;k<13;++k)fbefore[k]=wrapTGLRegisterRead(access,fregs[k]);
     const auto r=FunctionCast(wrapADLSSetMode,callbackXE->orgADLSSetMode)(controller,fb,path,timing);
+    if(r==0 && path && callbackXE->adlsDisplaySelected && callbackXE->adlsWiring.panel) { // G15 PSR: rearma no eDP (DDI A)
+        auto psrPort=*reinterpret_cast<void **>(static_cast<uint8_t *>(path)+0x3648);
+        auto psrCfg=psrPort?*reinterpret_cast<uint32_t **>(static_cast<uint8_t *>(psrPort)+0x548):nullptr;
+        if(psrCfg && psrCfg[0]==0)g15PsrCapture(controller,psrPort,callbackXE->orgTGLRegisterRead,callbackXE->orgTGLRegisterWrite,
+            callbackXE->orgTGLReadAUX,callbackXE->orgTGLWriteAUX,callbackXE->adlsDC6On,callbackXE->adlsDC6Off);
+    }
     if(callbackXE->adlsDisplaySelected && r!=0) {
         static uint32_t frec[30];
         frec[0]++;frec[1]=rec[20];frec[2]=r;frec[3]=rec[1];
@@ -19723,6 +20330,12 @@ void XE::tglObserveScanout(void *fb, void *plane, uint32_t event, bool done, uin
 // Per-thread slots span the synchronous gamma call; publication is after it has
 // returned and released its native register lock. Upload and readback stay separate.
 void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
+	g15DcTouch(reg); // G15: DC por software
+	// G15 PSR: sai antes de qualquer escrita que desligue pipe/DDI/DP_TP/painel ou mexa no CDCLK; mantem o PIPE_MISC[20].
+	if (g15PsrOn && (((reg == 0x70008 || reg == 0x64000 || reg == 0x60540) && !(value & 0x80000000U)) ||
+		(reg == 0xC7204 && !(value & 1)) || reg == 0x46000 || reg == 0x46070)) g15PsrSourceOff(4);
+	if (reg == 0x70030 && g15PsrPm) value |= 0x00100000U;
+	if (reg == 0x45444 && g15PsrOn && g15PsrAuxHeld) value |= 2U;
 	if (callbackXE->adlsDisplaySelected && g15BlNative && !g15BlBypass && (reg == 0xC8254 || reg == 0xC8258) &&
 		callbackXE->orgTGLRegisterRead) {
 		static uint32_t blmax = 0, blmin = 0;
@@ -19840,6 +20453,7 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
 }
 
 void XE::wrapTGLFastRegisterWrite(void *access, unsigned long reg, uint32_t value) {
+	g15DcTouch(reg); // G15: DC por software
 	tglProgramRecord(access, reg, value, 1, __builtin_return_address(0));
 	tglStreamAck(access, reg, value, 1, __builtin_return_address(0));
 	auto irq=reg==0x190010 ? tglFBIRQBegin(0,callbackXE->tglObservationController,value,

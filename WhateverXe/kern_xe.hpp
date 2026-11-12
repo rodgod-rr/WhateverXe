@@ -130,7 +130,7 @@ private:
     mach_vm_address_t orgADLSCDClockProbe {}, adlsDisableCDClock {}, adlsSetCDClock {};
     static uint64_t wrapADLSCDClockProbe(void *controller);
     // G15 (09/11): painel desligado no despertar via Doze -> Wake (o LightUpEDP nao e chamado); ver wrapADLSSetMode.
-    mach_vm_address_t orgADLSSetMode {}, adlsPanelPowerFn {};
+    mach_vm_address_t orgADLSSetMode {}, adlsPanelPowerFn {}; mach_vm_address_t adlsDC6On {}, adlsDC6Off {};
     static uint32_t wrapADLSSetMode(void *controller,void *fb,void *path,const void *timing);
     static uint8_t *adlsPowerTarget(void *power);
     static void wrapADLSPowerPG(void *power,bool enable,uint32_t requested);
