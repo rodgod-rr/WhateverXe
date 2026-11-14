@@ -51,6 +51,7 @@ namespace XELP { namespace DSI { struct Profile; } }
 class XE {
 public:
 	void init();
+    void captureFirmware(IOPCIDevice *,const XELP::Profile &);
     void selectProfile(const XELP::Profile &profile);
 	void deinit();
 
@@ -76,6 +77,7 @@ public:
     bool ownedDisplay13Framebuffer(IOService *fb) const;
     bool failedDSIWakeFor(IOService *fb) const;
     bool isIntelDonor(size_t index) const;
+    bool isGraphicsStack(size_t index) const;
     bool isIntelFramebuffer(size_t index) const;
     bool requiresIntelProvider() const;
     bool isIntelProvider(size_t index) const;
@@ -151,6 +153,8 @@ private:
     XELP::SmallGTResources display12SmallGT;
     XELP::Profile xeProfile;
     XELP::VBT::Ports firmwarePorts;
+    uint64_t firmwareOwnerID {};
+    XELP::Family firmwareFamily {};
     void xelpReadFirmware(IOPCIDevice *pci);
     void xelpLoadDisplayPool(IOService *provider);
     bool xelpInstallHostRPS(KernelPatcher &,size_t,mach_vm_address_t,size_t);
@@ -270,7 +274,7 @@ private:
     bool dsiPowerOffNotified {};
     uint32_t dsiPowerCallbackBusy {},dsiPowerOffEvents {},dsiPowerOnEvents {};
     uint32_t dsiRestoredEpoch {}; // Last shared reset consumed by this transport.
-    bool finishDisplay13SystemWake(IOService *);
+    bool finishDisplay13SystemWake(IOService *,bool nativePowerOn=false);
     uint32_t displayWakeEventEpoch {},displayWakeEventBusy {},displayWakeEventErrors {};
     uint8_t displayWakeEventPhase[3] {};
     static uint32_t wrapDSISetStream(IOService *,IOService *,OSObject *,const void *);
@@ -311,7 +315,7 @@ private:
     mach_vm_address_t dsiComputeGeometry {},dsiModeCPU[4] {};
     bool publishDSINativeBacking();
     bool publishDSINativeMode(IOService *);
-    uint32_t setDSIPresentation(IOService *,uint32_t,const XELP::DSI::AppleAdapter::Timing &);
+    uint32_t setDSIPresentation(IOService *,uint32_t,const XELP::DSI::AppleAdapter::Timing &,uint32_t depth=0);
     bool releaseDSILogical(IOService *);
     bool probeDSIModeGeometry(IOService *);
     bool prepareDSINativeBacking(IOService *);

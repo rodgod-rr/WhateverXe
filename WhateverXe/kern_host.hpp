@@ -9,6 +9,7 @@ private:
  static XeHost *callbackHost;
  XE xe;
  bool active {},systemWakeRecovery {};
+ bool kernelProcessed {},backlightSeen {},dataAccessSeen {};
  bool surfaceSeen {},graphicsSeen {},accelSeen {},providerSeen {};
  bool dependenciesSeen(size_t index) const {return surfaceSeen &&
   (!xe.isIntelFramebuffer(index) || !xe.requiresIntelProvider() || providerSeen) &&
@@ -34,6 +35,7 @@ private:
  mach_vm_address_t orgPanelSetDisplay {};
  static bool wrapPanelSetDisplay(IOService *,IOService *);
  void processKernel(KernelPatcher &);
+ void captureFirmware();
  void processKext(KernelPatcher &,size_t,mach_vm_address_t,size_t);
  enum { FB_DETECT, FB_RESET, FB_COPY, FB_ZEROFILL, FB_NONE, FB_TOTAL };
  uint32_t resetFramebuffer {FB_DETECT};

@@ -37,9 +37,11 @@ static const char *surfacePath[] { "/System/Library/Extensions/IOSurface.kext/Co
 static KernelPatcher::KextInfo surface { "com.apple.iokit.IOSurface",surfacePath,arrsize(surfacePath),{true},{},KernelPatcher::KextInfo::Unloaded };
 void XeHost::init() {
  callbackHost=this;
+ // Copy the firmware tables while the boot firmware still owns them. This
+ // performs no GPU initialization; native admission remains image-triggered.
+ lilu.onPatcherLoadForce([](void *u,KernelPatcher &){static_cast<XeHost *>(u)->captureFirmware();},this);
  PE_parse_boot_argn("gfxrst",&resetFramebuffer,sizeof(resetFramebuffer));
  if(resetFramebuffer>=FB_TOTAL)resetFramebuffer=FB_DETECT;
- lilu.onPatcherLoadForce([](void *u,KernelPatcher &p){static_cast<XeHost *>(u)->processKernel(p);},this);
  lilu.onKextLoadForce(nullptr,0,[](void *u,KernelPatcher &p,size_t i,mach_vm_address_t a,size_t s){static_cast<XeHost *>(u)->processKext(p,i,a,s);},this);
  lilu.onKextLoadForce(&graphics);
  lilu.onKextLoadForce(&accelFamily);
@@ -49,7 +51,14 @@ void XeHost::init() {
  XeDataAccess::init();
  g15KbdWakeInit();
 }
+void XeHost::captureFirmware() {
+ auto info=DeviceInfo::create();if(!info)return;
+ auto gpu=OSDynamicCast(IOPCIDevice,info->videoBuiltin);
+ if(gpu && WIOKit::awaitPublishing(gpu))xe.captureFirmware(gpu,XELP::deviceProfile(gpu));
+ DeviceInfo::deleter(info);
+}
 void XeHost::processKernel(KernelPatcher &patcher) {
+ kernelProcessed=true;
  auto info=DeviceInfo::create();if(!info)return;
  auto gpu=OSDynamicCast(IOPCIDevice,info->videoBuiltin);
  // Match WEG ordering: PCI config reads require a published IOPCIDevice.
@@ -118,6 +127,12 @@ void XeHost::processLoadedDependency(KernelPatcher &patcher,KernelPatcher::KextI
  }
 }
 void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ // Without Graphics, leave firmware scanout/GT state untouched. A real stack
+ // image is the activation trigger, still before its native probe/start.
+ if(!kernelProcessed) {
+  if(!xe.isGraphicsStack(index))return;
+  processKernel(patcher);
+ }
  if(!active)return;
  if(xe.isIntelProvider(index)) {
   // Donor imports exist before their native start, but Lilu's already-loaded
@@ -186,6 +201,8 @@ void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   return;
  }
  if(backlight.loadIndex==index) {
+  if(backlightSeen)return;
+  backlightSeen=true;
   if(backlightEnabled) {
    KernelPatcher::RouteRequest route("__ZN15AppleIntelPanel10setDisplayEP9IODisplay",wrapPanelSetDisplay,orgPanelSetDisplay);
    const bool ready=patcher.routeMultiple(index,&route,1,address,size);
@@ -194,9 +211,14 @@ void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   }
   return;
  }
- if(XeDataAccess::processKext(patcher,index,address,size))return;
+ if(index==XeDataAccess::dependency().loadIndex) {
+  if(!dataAccessSeen)dataAccessSeen=XeDataAccess::processKext(patcher,index,address,size);
+  return;
+ }
  if(graphics.loadIndex==index) {
-  if(systemWakeRecovery && !graphicsSeen) {
+  if(graphicsSeen)return;
+  graphicsSeen=true;
+  if(systemWakeRecovery) {
    const char *sym="__ZN13IOFramebuffer16setWSAAAttributeEjj";
    // Lilu resolves the symbol, verifies the image range, and builds the
    // entrance trampoline. This wrapper needs no private implementation ABI.
@@ -211,7 +233,6 @@ void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t a
    xe.setHostFramebufferEvent(paging?event:0);
    IORegistryEntry::getRegistryRoot()->setProperty("WEXHostPagingContractReady",paging);
    IORegistryEntry::getRegistryRoot()->setProperty("WEXDSIWakeRecoveryReady",ready);
-   graphicsSeen=true;
   }
   if(resetFramebuffer==FB_NONE)return;
   gIOFBVerboseBootPtr=patcher.solveSymbol<uint8_t *>(index,"__ZL16gIOFBVerboseBoot",address,size);
@@ -219,13 +240,13 @@ void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   patcher.clearError();return;
  }
  if(xe.isIntelDonor(index)) {
+  if(!dataAccessSeen)processLoadedDependency(patcher,XeDataAccess::dependency());
   if(!surfaceSeen)processLoadedDependency(patcher,surface);
   if(xe.isIntelFramebuffer(index) && xe.requiresIntelProvider() && !providerSeen)
    processLoadedDependency(patcher,kextAppleIntelTGLCompat);
-  if(systemWakeRecovery) {
-   if(!graphicsSeen)processLoadedDependency(patcher,graphics);
-   if(!accelSeen)processLoadedDependency(patcher,accelFamily);
-  }
+  if(!graphicsSeen && (systemWakeRecovery || resetFramebuffer!=FB_NONE))processLoadedDependency(patcher,graphics);
+  if(systemWakeRecovery && !accelSeen)processLoadedDependency(patcher,accelFamily);
+  if(backlightEnabled && !backlightSeen)processLoadedDependency(patcher,backlight);
   IORegistryEntry::getRegistryRoot()->setProperty("WEXHostDependenciesSeen",dependenciesSeen(index));
   // Always install the donor's probe/start guards in this callback. Returning
   // with queued work lets OSKext enter the unpatched native lifecycle. Unknown
