@@ -15668,8 +15668,11 @@ static mach_vm_address_t g15HostSubmitOrg=0;static uint32_t g15LastSubmitFlags[6
 // mesma do TGLCSBIO: no Gen12 o BCS fica no dominio GT e VCS/VECS nos de midia). -wex-g15-execwake-rcs deixa so o RCS.
 static volatile uint32_t g15ExecWakeMask=0;static int g15ExecWakeRcsOnly=-1;static uint8_t *g15ExecWakeOwnerE[6]={};
 static uint64_t g15ExecWakeTakesE=0,g15ExecWakeRelsE=0;
+static void g15ExecWakeTimer(thread_call_param_t,thread_call_param_t);
+static thread_call_t g15ExecWakeCall;
 static void g15ExecWakeArgs() {
  if(g15ExecWakeOff<0)g15ExecWakeOff=checkKernelArgument("-wex-g15-execwake-off");
+ if(!g15ExecWakeCall && !g15ExecWakeOff){static volatile uint32_t once=0;if(__sync_bool_compare_and_swap(&once,0,1))g15ExecWakeCall=thread_call_allocate(g15ExecWakeTimer,nullptr);}
  if(g15ExecWakeRcsOnly<0)g15ExecWakeRcsOnly=checkKernelArgument("-wex-g15-execwake-rcs");
 }
 static void g15ExecWakeTakeE(unsigned e,uint8_t *owner) {
@@ -15969,16 +15972,34 @@ static void g15HistDone(unsigned e,uint32_t i,const uint8_t *st,uint8_t type=0) 
 // G15: soltura dos motores 1..5. No ActiveToIdle as listas quase sempre ainda estao ocupadas (o original so as limpa
 // depois), entao a checagem ali deixava a referencia presa (teste 12/11 18:21: ewm=e com os motores ociosos). Varre em
 // todo envio e todo evento de qualquer motor: solta quando o ultimo evento do motor e um ActiveToIdle e as listas esvaziaram.
-static void g15ExecWakeSweep() {
- const uint32_t mask=g15ExecWakeMask;if(!mask)return;
- for(unsigned e=1;e<6;++e) {
+// G15 (13/11 23:30): o RCS tambem (antes so 1..5). A/B de 13/11: com a tela acesa e parada o RCS ficava com a referencia
+// (o ActiveToIdle chega antes de o original limpar as listas e depois nao vem mais evento) -> GT sem RC6, pacote preso em
+// C0, 13,6 W contra 2,5 W sem o execwake. Bit 0 da mascara = RCS (g15ExecWake). Retorna se ainda falta soltar algum ocioso.
+static bool g15ExecWakeSweep() {
+ const uint32_t mask=g15ExecWakeMask|(g15ExecWake?1U:0U);if(!mask)return false;
+ bool pending=false;
+ for(unsigned e=0;e<6;++e) {
   if(!(mask&(1U<<e)))continue;
   auto st=static_cast<uint8_t *>(tglCSBEngines[e].streamer);const uint32_t n=g15HistN[e];if(!st || !n)continue;
   const auto &h=g15Hist[e][(n-1)&31];if(h.type!='C' || h.handler!=3)continue;
   bool idle=true;
   for(unsigned i=0;i<4;++i)if(*reinterpret_cast<void **>(st+0x30+i*8))idle=false;
-  if(idle && g15HistN[e]==n)g15ExecWakeReleaseE(e);
+  if(!idle){pending=true;continue;}
+  if(g15HistN[e]!=n)continue;   // chegou envio/evento novo no meio: o proximo ActiveToIdle cuida
+  if(e==0)g15ExecWakeReleaseRcs();else g15ExecWakeReleaseE(e);
  }
+ return pending;
+}
+// Checagem atrasada: sem evento depois do ultimo ActiveToIdle (tela parada) a varredura nao rodaria. 2 ms depois do
+// ocioso, repete ate 25 vezes enquanto o original ainda nao limpou as listas.
+static volatile uint32_t g15ExecWakeTries=0;
+static uint64_t g15ExecWakeLate=0;
+static void g15ExecWakeArm(){if(!g15ExecWakeCall)return;uint64_t dl;clock_interval_to_deadline(2,1000000,&dl);thread_call_enter_delayed(g15ExecWakeCall,dl);}
+static void g15ExecWakeTimer(thread_call_param_t,thread_call_param_t) {
+ const uint32_t before=(g15ExecWake?1U:0U)|g15ExecWakeMask;
+ const bool pending=g15ExecWakeSweep();
+ if(before!=((g15ExecWake?1U:0U)|g15ExecWakeMask))++g15ExecWakeLate;
+ if(pending && __sync_add_and_fetch(&g15ExecWakeTries,1)<25)g15ExecWakeArm();
 }
 static void g15LogHist(const char *tag,uint32_t n) {
  for(unsigned e=0;e<6;++e) {
@@ -16039,12 +16060,12 @@ static void g15LogSched(const char *tag,uint32_t n,uint32_t cs) {
  auto s32=[&](uint32_t o){return *reinterpret_cast<uint32_t *>(sched+o);};
  uint64_t flags;memcpy(&flags,owner+0x1190,sizeof(flags));
  g15Logf("G15-sched %s #%u global pausa=%u termico=%u,%u,%u,%u teto=%u freio=%u,%u,%u,%u atraso=%u,%u,%u,%u idle=%x dpsm=%x flags=%llx "
-  "mst=%x dw=%x,%x ier=%x imr=%x,%x fw=%x,%x swirq=%llu hwirq=%llu csb=%llu asleep=%x fwreq=%x execwake=%u/%llu/%llu ewm=%x/%llu/%llu fwgt=%x\n",tag,n,sched[0xA88],
+  "mst=%x dw=%x,%x ier=%x imr=%x,%x fw=%x,%x swirq=%llu hwirq=%llu csb=%llu asleep=%x fwreq=%x execwake=%u/%llu/%llu ewm=%x/%llu/%llu late=%llu fwgt=%x\n",tag,n,sched[0xA88],
   s32(0xA90),s32(0xA94),s32(0xA98),s32(0xA9C),s32(0xA8C),sched[0x5E4],sched[0x764],sched[0x8E4],sched[0xA64],
   s32(0x5E0),s32(0x760),s32(0x8E0),s32(0xA60),s32(0xCD0),*reinterpret_cast<uint32_t *>(owner+0x1458),flags,
   rd(0x190010),rd(0x190018),rd(0x19001C),rd(0x190030),rd(0x190090),rd(0x1900A0),rd(0xD84),rd(0x130044),
   g15SWIrqN,g15HWIrqN,g15CSBTotal,(unsigned)g15GpuAsleep,rd(0xA278),g15ExecWake,g15ExecWakeTakes,g15ExecWakeRels,
-  g15ExecWakeMask,g15ExecWakeTakesE,g15ExecWakeRelsE,rd(0xA188));
+  g15ExecWakeMask,g15ExecWakeTakesE,g15ExecWakeRelsE,g15ExecWakeLate,rd(0xA188));
  // G15 (13/11): GT inteiro (o hang de 12/11 21:17 parou RCS, BCS e VCS juntos): erro/falha de memoria (GAM/TLB),
  // RC6 e estado dos poços de energia. O historico so nos 6 primeiros: o arquivo de 12/11 21:17 encheu os 256 KB.
  g15Logf("G15-gt %s #%u err=%x done=%x fault=%x tlb=%x:%x rcstate=%x rcctl=%x corestat=%x pwgt=%x rc6=%x mstr=%x dw0=%x dw1=%x "
@@ -16281,6 +16302,7 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
    bool idle=true;
    for(unsigned i=0;i<4;++i)if(*reinterpret_cast<void **>(io.streamer+0x30+i*8))idle=false;
    if(idle){if(io.engine==0)g15ExecWakeReleaseRcs();else g15ExecWakeReleaseE(io.engine);}
+   else {g15ExecWakeTries=0;g15ExecWakeArm();}
   }
   g15ExecWakeSweep();
   if (record) {
