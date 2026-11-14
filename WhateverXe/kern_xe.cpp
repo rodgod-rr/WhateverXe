@@ -15658,7 +15658,33 @@ static void g15HangSysctlRegister();
 static volatile uint32_t g15ExecWake=0;static int g15ExecWakeOff=-1;static uint8_t *g15ExecWakeOwner=nullptr;
 static uint64_t g15ExecWakeTakes=0,g15ExecWakeRels=0;
 static mach_vm_address_t g15HostSubmitOrg=0;static uint32_t g15LastSubmitFlags[6]={};
+// G15 (12/11 noite): o hang das 17:54 foi no BCS, motor sem essa protecao (pend=1 no HWSP sem interrupcao, anel parado
+// em 6a04/6ad0, ACK do GT = 0). Mesma regra para os motores 1..5, um bit por motor, com os 3 dominios (mascara 7, a
+// mesma do TGLCSBIO: no Gen12 o BCS fica no dominio GT e VCS/VECS nos de midia). -wex-g15-execwake-rcs deixa so o RCS.
+static volatile uint32_t g15ExecWakeMask=0;static int g15ExecWakeRcsOnly=-1;static uint8_t *g15ExecWakeOwnerE[6]={};
+static uint64_t g15ExecWakeTakesE=0,g15ExecWakeRelsE=0;
+static void g15ExecWakeArgs() {
+ if(g15ExecWakeOff<0)g15ExecWakeOff=checkKernelArgument("-wex-g15-execwake-off");
+ if(g15ExecWakeRcsOnly<0)g15ExecWakeRcsOnly=checkKernelArgument("-wex-g15-execwake-rcs");
+}
+static void g15ExecWakeTakeE(unsigned e,uint8_t *owner) {
+ if(e<1 || e>5 || !owner)return;
+ g15ExecWakeArgs();if(g15ExecWakeOff || g15ExecWakeRcsOnly)return;
+ if(__sync_fetch_and_or(&g15ExecWakeMask,1U<<e)&(1U<<e))return;
+ tglCSBForceWake[0](owner,true,7);g15ExecWakeOwnerE[e]=owner;++g15ExecWakeTakesE;
+}
+static void g15ExecWakeReleaseE(unsigned e) {
+ if(e<1 || e>5 || !(__sync_fetch_and_and(&g15ExecWakeMask,~(1U<<e))&(1U<<e)))return;
+ if(g15ExecWakeOwnerE[e])tglCSBForceWake[0](g15ExecWakeOwnerE[e],false,7);
+ ++g15ExecWakeRelsE;
+}
 static void g15ExecWakeRelease() {
+ for(unsigned e=1;e<6;++e)g15ExecWakeReleaseE(e);
+ if(!__sync_bool_compare_and_swap(&g15ExecWake,1,0))return;
+ if(g15ExecWakeOwner)tglCSBForceWake[0](g15ExecWakeOwner,false,1);
+ ++g15ExecWakeRels;
+}
+static void g15ExecWakeReleaseRcs() {
  if(!__sync_bool_compare_and_swap(&g15ExecWake,1,0))return;
  if(g15ExecWakeOwner)tglCSBForceWake[0](g15ExecWakeOwner,false,1);
  ++g15ExecWakeRels;
@@ -15935,6 +15961,20 @@ static void g15HistDone(unsigned e,uint32_t i,const uint8_t *st,uint8_t type=0) 
  if(e>=6)return;auto &h=g15Hist[e][i&31];if(type)h.type=type;
  h.actA=static_cast<uint8_t>(*reinterpret_cast<const uint32_t *>(st+0x50));h.canA=st[0x1C3C];
 }
+// G15: soltura dos motores 1..5. No ActiveToIdle as listas quase sempre ainda estao ocupadas (o original so as limpa
+// depois), entao a checagem ali deixava a referencia presa (teste 12/11 18:21: ewm=e com os motores ociosos). Varre em
+// todo envio e todo evento de qualquer motor: solta quando o ultimo evento do motor e um ActiveToIdle e as listas esvaziaram.
+static void g15ExecWakeSweep() {
+ const uint32_t mask=g15ExecWakeMask;if(!mask)return;
+ for(unsigned e=1;e<6;++e) {
+  if(!(mask&(1U<<e)))continue;
+  auto st=static_cast<uint8_t *>(tglCSBEngines[e].streamer);const uint32_t n=g15HistN[e];if(!st || !n)continue;
+  const auto &h=g15Hist[e][(n-1)&31];if(h.type!='C' || h.handler!=3)continue;
+  bool idle=true;
+  for(unsigned i=0;i<4;++i)if(*reinterpret_cast<void **>(st+0x30+i*8))idle=false;
+  if(idle && g15HistN[e]==n)g15ExecWakeReleaseE(e);
+ }
+}
 static void g15LogHist(const char *tag,uint32_t n) {
  for(unsigned e=0;e<6;++e) {
   const uint32_t total=g15HistN[e];if(!total)continue;
@@ -15974,18 +16014,39 @@ static void g15LogSched(const char *tag,uint32_t n,uint32_t cs) {
    *reinterpret_cast<uint32_t *>(st+0x1C40),*reinterpret_cast<uint32_t *>(st+0x50),ids[0],ids[1],ids[2],ids[3],pend,head,hwsTail,
    rd(io.pointerReg),rd(base+0x34),rd(base+0x30),rd(base+0x234),rd(base+0x238),since,eng.consumed,rd(base+0x510),rd(base+0x514),
    rd(base+0x550));
+  // G15 (13/11): onde o motor parou (o .gpuRestart da Apple so traz o RCS e le os outros ja zerados). Base do motor
+  // = ponteiro do CSB - 0x3A0 (RCS 0x2000, BCS 0x22000, VCS 0x1C0000, VECS 0x1C8000); CSB inteiro do HWSP (12 x 64 bits).
+  g15Logf("G15-regs %s #%u e=%u base=%x ipeir=%x ipehr=%x acthd=%x:%x dmafadd=%x bbaddr=%x:%x bbstate=%x instdone=%x instps=%x "
+   "eir=%x esr=%x emr=%x mimode=%x ctl=%x start=%x nopid=%x hws=%x mode=%x psmi=%x ctxctl=%x ccid=%x\n",tag,n,e,base,rd(base+0x64),
+   rd(base+0x68),rd(base+0x5C),rd(base+0x74),rd(base+0x78),rd(base+0x168),rd(base+0x140),rd(base+0x110),rd(base+0x6C),
+   rd(base+0x70),rd(base+0xB0),rd(base+0xB8),rd(base+0xB4),rd(base+0x9C),rd(base+0x3C),rd(base+0x38),rd(base+0x94),
+   rd(base+0x80),rd(base+0x29C),rd(base+0x50),rd(base+0x244),rd(base+0x180));
+  {
+   char line[420];size_t used=0;line[0]=0;
+   for(unsigned i=0;i<TGLCSB::Capacity && used<sizeof(line);++i)
+    used+=snprintf(line+used,sizeof(line)-used,"%s%llx",i?" ":"",
+     static_cast<unsigned long long>(*reinterpret_cast<volatile uint64_t *>(io.hwsp+0x40+i*8)));
+   g15Logf("G15-csb %s #%u e=%u head=%u hwsTail=%u: %s\n",tag,n,e,head,hwsTail,line);
+  }
  }
  if(!sched || !owner || !bar)return;
  auto rd=[&](uint32_t r){return *reinterpret_cast<volatile uint32_t *>(bar+r);};
  auto s32=[&](uint32_t o){return *reinterpret_cast<uint32_t *>(sched+o);};
  uint64_t flags;memcpy(&flags,owner+0x1190,sizeof(flags));
  g15Logf("G15-sched %s #%u global pausa=%u termico=%u,%u,%u,%u teto=%u freio=%u,%u,%u,%u atraso=%u,%u,%u,%u idle=%x dpsm=%x flags=%llx "
-  "mst=%x dw=%x,%x ier=%x imr=%x,%x fw=%x,%x swirq=%llu hwirq=%llu csb=%llu asleep=%x fwreq=%x execwake=%u/%llu/%llu\n",tag,n,sched[0xA88],
+  "mst=%x dw=%x,%x ier=%x imr=%x,%x fw=%x,%x swirq=%llu hwirq=%llu csb=%llu asleep=%x fwreq=%x execwake=%u/%llu/%llu ewm=%x/%llu/%llu fwgt=%x\n",tag,n,sched[0xA88],
   s32(0xA90),s32(0xA94),s32(0xA98),s32(0xA9C),s32(0xA8C),sched[0x5E4],sched[0x764],sched[0x8E4],sched[0xA64],
   s32(0x5E0),s32(0x760),s32(0x8E0),s32(0xA60),s32(0xCD0),*reinterpret_cast<uint32_t *>(owner+0x1458),flags,
   rd(0x190010),rd(0x190018),rd(0x19001C),rd(0x190030),rd(0x190090),rd(0x1900A0),rd(0xD84),rd(0x130044),
-  g15SWIrqN,g15HWIrqN,g15CSBTotal,(unsigned)g15GpuAsleep,rd(0xA278),g15ExecWake,g15ExecWakeTakes,g15ExecWakeRels);
- g15LogHist(tag,n);
+  g15SWIrqN,g15HWIrqN,g15CSBTotal,(unsigned)g15GpuAsleep,rd(0xA278),g15ExecWake,g15ExecWakeTakes,g15ExecWakeRels,
+  g15ExecWakeMask,g15ExecWakeTakesE,g15ExecWakeRelsE,rd(0xA188));
+ // G15 (13/11): GT inteiro (o hang de 12/11 21:17 parou RCS, BCS e VCS juntos): erro/falha de memoria (GAM/TLB),
+ // RC6 e estado dos poços de energia. O historico so nos 6 primeiros: o arquivo de 12/11 21:17 encheu os 256 KB.
+ g15Logf("G15-gt %s #%u err=%x done=%x fault=%x tlb=%x:%x rcstate=%x rcctl=%x corestat=%x pwgt=%x rc6=%x mstr=%x dw0=%x dw1=%x "
+  "gtfifo=%x fwgt=%x ackgt=%x fwr=%x ackr=%x fwm=%x ackm=%x\n",tag,n,rd(0x40A0),rd(0x40B0),rd(0xCEC4),rd(0xCEB8),rd(0xCEBC),
+  rd(0xA094),rd(0xA090),rd(0x138060),rd(0xA2A0),rd(0x138108),rd(0x190010),rd(0x190018),rd(0x19001C),rd(0x120000),
+  rd(0xA188),rd(0x130044),rd(0xA278),rd(0xD84),rd(0xA270),rd(0xD88));
+ if(n<=6 || tag[0]=='m')g15LogHist(tag,n);
 }
 static bool g15Progressed(const uint8_t *st,uint32_t from,unsigned ms) {
  for(unsigned i=0;i<=ms/10;++i) {
@@ -16071,7 +16132,7 @@ static bool g15WrapCheckProgress(void *schedObj,uint32_t cs) {
  }
  g15LogFlush();return ok;
 }
-// Teste do canal sem esperar um hang (sem sudo): `sysctl debug.g15hang=1` registra o estado atual (G15-sched manual) e
+// Teste do canal sem esperar um hang (com sudo: a gravacao usa a credencial de quem chama; sem sudo da 13): `sudo sysctl debug.g15hang=1` registra o estado atual (G15-sched manual) e
 // grava o arquivo; `sysctl debug.g15hang` devolve o codigo da ultima gravacao (0 = gravou, -999 = nunca tentou).
 static int g15HangSysctl SYSCTL_HANDLER_ARGS {
  int v=g15LogFlushRc;const int e=sysctl_handle_int(oidp,&v,0,req);
@@ -16211,11 +16272,12 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
   }
   tglCSBMethods[handler](streamer,&entry);
   g15HistDone(io.engine,g15h,io.streamer);
-  if(io.engine==0 && handler==3 && g15ExecWake) { // G15: RCS ocioso (nenhuma lista ativa nem pendente) -> solta o render
+  if(handler==3 && (io.engine==0 ? g15ExecWake!=0 : (g15ExecWakeMask&(1U<<io.engine))!=0)) { // G15: motor ocioso (nenhuma lista ativa nem pendente) -> solta
    bool idle=true;
    for(unsigned i=0;i<4;++i)if(*reinterpret_cast<void **>(io.streamer+0x30+i*8))idle=false;
-   if(idle)g15ExecWakeRelease();
+   if(idle){if(io.engine==0)g15ExecWakeReleaseRcs();else g15ExecWakeReleaseE(io.engine);}
   }
+  g15ExecWakeSweep();
   if (record) {
    // Existing fixed history: native return and resulting banks, no MMIO/wait.
    uint64_t banks[12];tglHostBanks(io.streamer,banks);
@@ -16883,6 +16945,8 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
   // interrupt client used by CSB reads has no nesting count. Restrict this
   // correction to the verified multithreaded wake path, with skip disabled.
   if (io.engine==0 && (nativeFlags&0x1800)==0x800) renderWakeOwner=io.owner;
+  // G15: demais motores seguram os 3 dominios do 1o envio ate o ActiveToIdle com as listas vazias (ver g15ExecWakeMask).
+  else if (io.engine!=0 && (nativeFlags&0x1800)==0x800) g15ExecWakeTakeE(io.engine,io.owner);
  }
  auto x=static_cast<uint8_t *>(streamer); uint32_t n=arrsize(tglHost.submit);
  if (tglHost.owner && *reinterpret_cast<void **>(x+0x10)==tglHost.owner)
@@ -17015,6 +17079,12 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
  unsigned g15e=6;for(unsigned i=0;i<6;++i)if(tglCSBEngines[i].streamer==streamer)g15e=i;
  const uint32_t g15h=g15HistAdd(g15e,'S',flags,0,static_cast<uint8_t *>(streamer));
  if(g15e<6)g15LastSubmitFlags[g15e]=flags;
+ // G15: de novo depois do 'S' no historico (a varredura pode ter soltado entre a 1a tentativa e o registro do envio).
+ if(g15e>=1 && g15e<6 && (g15ExecWakeMask&(1U<<g15e))==0 && tglCSB12Enabled) {
+  auto o=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(streamer)+0x10);uint64_t nf=0;if(o)memcpy(&nf,o+0x1190,sizeof(nf));
+  if((nf&0x1800)==0x800)g15ExecWakeTakeE(g15e,o);
+ }
+ g15ExecWakeSweep();
  g15HostSubmitOrg=callbackXE->orgTGLHostSubmit;
  FunctionCast(wrapTGLHostSubmit,callbackXE->orgTGLHostSubmit)(streamer,flags);
  g15HistDone(g15e,g15h,static_cast<uint8_t *>(streamer));
@@ -17038,7 +17108,7 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
   static uint32_t retained;
   const bool keep=checkKernelArgument("-wex-tgl-hold-render-wake") &&
    __atomic_exchange_n(&retained,1U,__ATOMIC_RELAXED)==0;
-  if(g15ExecWakeOff<0)g15ExecWakeOff=checkKernelArgument("-wex-g15-execwake-off");
+  g15ExecWakeArgs();
   // G15: o 1o envio com o RCS ocioso fica com a referencia ate o ActiveToIdle (ver g15ExecWake).
   const bool g15keep=!keep && !g15ExecWakeOff && __sync_bool_compare_and_swap(&g15ExecWake,0,1);
   if (keep) IORegistryEntry::getRegistryRoot()->setProperty("TGLRenderWakeLifetimeTrial",309,32);
