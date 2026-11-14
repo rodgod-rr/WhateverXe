@@ -3587,9 +3587,207 @@ static uint32_t g15DcFastRd(void *a,unsigned long reg) {
 static void g15DcFastWr(void *a,unsigned long reg,uint32_t v) {
  g15DcTouch(reg);reinterpret_cast<void (*)(void *,unsigned long,uint32_t)>(g15DcOrgFastWr)(a,reg,v);
 }
+// G15 (14/11): com o PSR1 ativo e a tela parada o pipe A dorme e o contador de quadros (0x70040) para; o
+// hwWaitForVBlank da Apple le esse contador e espera ele mudar ate 500 ms ("Wait for VBL timed out" / "did not wait for
+// frame change" no dmesg a cada 0,5 s). Antes da espera, com o PSR fora do ocioso, uma escrita em CURSURFLIVE do pipe A
+// forca a saida (psr_force_hw_tracking_exit do i915 em skl+); o PSR volta sozinho depois dos quadros parados.
+// debug.g15vbl=0 desliga o chute (comparacao); contadores e quem chama (desvio no kext) em debug.g15psr_info.
+static mach_vm_address_t g15OrgWaitVbl=0,g15FbBase=0;
+static volatile uint32_t g15VblWaits=0,g15VblKicks=0,g15VblKick=1;
+static uint32_t g15VblWho[4]={},g15VblWhoN[4]={};
+static int g15WaitVbl(void *that,void *fb,uint32_t arg) {
+ __sync_fetch_and_add(&g15VblWaits,1);
+ if(g15VblKick && g15PsrOn && that==g15Psr.ctl && g15Psr.rd && g15Psr.wr) {
+  const uint32_t st=g15PsrR(0x60840);
+  if(st!=~0U && (st&0xE0000000U)){g15PsrW(0x700AC,0);__sync_fetch_and_add(&g15VblKicks,1);}
+ }
+ const uint32_t who=static_cast<uint32_t>(reinterpret_cast<uintptr_t>(__builtin_return_address(0))-g15FbBase);
+ for(unsigned i=0;i<4;++i){
+  if(g15VblWho[i]==who){g15VblWhoN[i]++;break;}
+  if(!g15VblWho[i]){g15VblWho[i]=who;g15VblWhoN[i]=1;break;}
+ }
+ return reinterpret_cast<int (*)(void *,void *,uint32_t)>(g15OrgWaitVbl)(that,fb,arg);
+}
+static int g15VblSysctl SYSCTL_HANDLER_ARGS {
+ (void)arg1;(void)arg2;
+ int v=static_cast<int>(g15VblKick);const int e=sysctl_handle_int(oidp,&v,0,req);
+ if(!e && req->newptr)g15VblKick=v?1:0;
+ return e;
+}
+SYSCTL_PROC(_debug,OID_AUTO,g15vbl,CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY|CTLFLAG_LOCKED,nullptr,0,g15VblSysctl,"I","");
 static void g15PsrInit(uint32_t mode);
 // Fora do processKextFull (o quadro de pilha dele esta no limite do build). FastRead/FastWrite tambem passam pelo
 // g15DcTouch (o FastWrite pode ja ter rota da WEX: ai o toque fica no wrapTGLFastRegisterWrite).
+// G15 (14/11, WhateverXe #131, analise do gupaixao em outro G15 5530): logo da maca repetido 8x / em pedacos quando a UHD
+// assume no boot. O GOP entrega o console LINEAR em GGTT 0, mas IGAccelDisplayPipe::initResourceInfo descreve o recurso
+// do FB 0 com o EFITilingMode do Mac (X: res+0x194 = 2); o 1o blit do kernel le o console como X e o logo sai 8 vezes.
+// Depois do initFramebufferResource original, so para o console (memoria do aperture do sistema, GGTT 0, FB 0, geometria
+// igual ao boot_args.Video, 32 bpp/formato 0xC0, modo grafico sem -v, doador disse X e nao Y) grava res+0x194 = 0 (LINEAR),
+// a mesma escrita que o initResourceInfo faria. Superficies do WindowServer, espelho, escala e Y ficam intocados.
+// Guardas de bytes do doador (AppleIntelTGLGraphics 16.0.0 do Graphics 0.4.x); se nao casarem, nada e roteado.
+// Registro "G15FbResLinear" = {roteado, aplicado, inerte, ultimo motivo}. -wex-g15-fbres-linear-off desliga.
+// 14/11 (2a versao): a 1a aplicava em TODA recriacao do recurso do FB 0 (3 por boot) e o FB 0 passa a guardar conteudo X
+// do WindowServer depois da 1a troca de modo: a tela do desligamento saiu duplicada. O console LINEAR do GOP so existe
+// enquanto o plano mostra o console. 3a versao: aplica so na janela do console do boot (60 s e SURF do pipe A = 0 no hardware);
+// motivo 0x1000 = fora dela (o gupaixao aplica 4 vezes no boot, com prova no hardware).
+// Janela do console do boot (passos 1 e 2 do #131): so nos primeiros 60 s de uptime E com o plano 1 do pipe A ainda
+// mostrando GGTT 0 (PLANE_SURF lido no hardware pelo acessor do framebuffer, guardado na 1a escrita vista).
+typedef uint32_t (*G15RegRd)(void *,unsigned long);
+static int g15PcActive=-1;                       // passo 1: -1 = decidir na 1a escrita, 1 = adotado, 0 = recusado
+static void *g15PcAccess=nullptr;static G15RegRd g15PcRead=nullptr;
+static bool g15BootWindow(){uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns<60000000000ULL;}
+static uint32_t g15HwSurf(){return (g15PcAccess && g15PcRead)?g15PcRead(g15PcAccess,0x7019C):~0U;}
+// Diagnostico do #131 (14/11): "G15FbResLog" e "G15FlipLog" = as 12 primeiras chamadas, uma linha cada, com o uptime em ms.
+static uint32_t g15UpMs(){uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return static_cast<uint32_t>(ns/1000000ULL);}
+static void g15DiagLine(const char *key,unsigned &n,const char *line){
+ if(n>=12)return;n++;
+ auto root=IORegistryEntry::getRegistryRoot();
+ auto old=OSDynamicCast(OSArray,root->getProperty(key));
+ auto arr=old?OSArray::withArray(old,12):OSArray::withCapacity(12);
+ auto st=OSString::withCString(line);
+ if(arr && st){arr->setObject(st);root->setProperty(key,arr);}
+ OSSafeReleaseNULL(st);OSSafeReleaseNULL(arr);
+}
+static unsigned g15FbResLogN=0,g15FlipLogN=0;
+static mach_vm_address_t g15OrgFbRes=0;
+static uint32_t g15FbResStat[4]={};
+static void g15FbResPublish(){IORegistryEntry::getRegistryRoot()->setProperty("G15FbResLinear",g15FbResStat,sizeof(g15FbResStat));}
+static void *g15FbRes(void *pipe,uint32_t fbIndex,void *resource) {
+ void *memory=reinterpret_cast<void *(*)(void *,uint32_t,void *)>(g15OrgFbRes)(pipe,fbIndex,resource);
+ if(!pipe || !resource)return memory;
+ auto p=static_cast<const uint8_t *>(pipe);auto r=static_cast<uint8_t *>(resource);
+ auto accel=*reinterpret_cast<const uint8_t * const *>(p+0x88);
+ if(!accel)return memory;
+ uint64_t p12A0,p12B8,ggtt,rowBytes;uint32_t f28,idx,tiling,r108,format;uint16_t w,h;
+ memcpy(&p12A0,p+0x12A0,8);memcpy(&p12B8,p+0x12B8,8);memcpy(&f28,accel+0xF28,4);memcpy(&ggtt,p+0x12D0,8);memcpy(&idx,p+0x284,4);
+ memcpy(&tiling,r+0x194,4);memcpy(&r108,r+0x108,4);memcpy(&format,r+0x190,4);memcpy(&w,r+0xB0,2);memcpy(&h,r+0xB2,2);memcpy(&rowBytes,r+0xB8,8);
+ const uint8_t bpp=r[0xD8];
+ uint32_t why=0;
+ if(!memory)why|=2;
+ if(!(f28==2 || (!p12A0 && !p12B8)))why|=4;
+ if(ggtt)why|=8;
+ if(idx)why|=0x10;
+ const uint64_t vRow=PE_state.video.v_rowBytes,vW=PE_state.video.v_width,vH=PE_state.video.v_height,vD=PE_state.video.v_depth;
+ if(!vRow || rowBytes!=vRow)why|=0x40;
+ if(!vW || !vH || w!=vW || h!=vH)why|=0x80;
+ if(vD!=32 || bpp!=4 || format!=0xC0)why|=0x100;
+ if(PE_state.video.v_display!=1 || checkKernelArgument("-v"))why|=0x200;
+ if(tiling!=2)why|=0x400;
+ if(r108&(1U<<27))why|=0x800;
+ if(g15PcActive!=1)why|=0x1000;                 // so com o plano do console adotado (passo 1): GGTT 0 linear dos dois lados
+ // (14/11, registro do boot) Aqui o accel+0xF28 = 0x80000003 e o console tambem vai para um recurso ESCALADO (memoria
+ // propria, GGTT != 0, mesma geometria) descrito X: as superficies do WindowServer copiavam dele e mostravam 8 macas por ~1 s.
+ // Teste: tambem esse recurso vira LINEAR, so com o plano do console adotado e ainda no ar (SURF 0) e nos 2 min do boot.
+ // Resultado: sem efeito (as 8 macas seguiram) -> tirado. Padrao dos boots: toda versao que aplicou o passo 2 mais de uma vez
+ // ficou PIOR (~1 s); so a 1a recriacao tem o console linear puro (entre a 1a e a 2a algo ja escreveu X em GGTT 0).
+ if(g15FbResStat[1])why|=0x2000;                 // passo 2 so na 1a recriacao do boot
+ g15FbResStat[3]=why;
+ if(!why){const uint32_t lin=0;memcpy(r+0x194,&lin,4);g15FbResStat[1]++;}else g15FbResStat[2]++;
+ g15FbResPublish();
+ {char line[200];snprintf(line,sizeof(line),"%u ms motivo %x fb %u ggtt %llx esc %llx/%llx f28 %u %ux%u row %llu fmt %x tile %u->%u hwsurf %x pc %d",
+  g15UpMs(),why,idx,ggtt,p12A0,p12B8,f28,w,h,rowBytes,format,tiling,why?tiling:0,g15HwSurf(),g15PcActive);
+  g15DiagLine("G15FbResLog",g15FbResLogN,line);}
+ return memory;
+}
+__attribute__((noinline)) static void g15FbResBoot(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ // 14/11: nenhuma versao do #131 resolveu aqui (usuario pediu voltar): tudo do #131 so com -wex-g15-131 (teste).
+ if(!checkKernelArgument("-wex-g15-131") || checkKernelArgument("-wex-g15-fbres-linear-off") || size<0x7F440)return;
+ const uint8_t head[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53};
+ const uint8_t tilingStore[]{0x45,0x89,0xAF,0x94,0x01,0,0};
+ const uint8_t cmp12B8[]{0x4D,0x39,0xA6,0xB8,0x12,0,0},aperture[]{0x31,0xF6,0xFF,0x90,0xA8,0x09,0,0};
+ const char *resInit="__ZN18IGAccelDisplayPipe23initFramebufferResourceEjP16IOAccelResource2";
+ const char *resInfo="__ZN18IGAccelDisplayPipe16initResourceInfoEP16IOAccelResource2RK18IOPixelInformationb";
+ const bool ok=patcher.solveSymbol<mach_vm_address_t>(index,resInit,address,size)==address+0x7F160 &&
+  patcher.solveSymbol<mach_vm_address_t>(index,resInfo,address,size)==address+0x7EE9A &&
+  !memcmp(reinterpret_cast<void *>(address+0x7F160),head,sizeof(head)) &&
+  !memcmp(reinterpret_cast<void *>(address+0x7EF87),tilingStore,sizeof(tilingStore)) &&
+  !memcmp(reinterpret_cast<void *>(address+0x7F306),cmp12B8,sizeof(cmp12B8)) &&
+  !memcmp(reinterpret_cast<void *>(address+0x7F34C),aperture,sizeof(aperture));
+ patcher.clearError();
+ if(ok) {
+  KernelPatcher::RouteRequest route[]{{resInit,g15FbRes,g15OrgFbRes}};
+  g15FbResStat[0]=patcher.routeMultiple(index,route,arrsize(route),address,size)?1:3;
+ } else g15FbResStat[0]=2;
+ patcher.clearError();
+ g15FbResPublish();
+}
+// G15 (14/11, #131 passo 1, "plane coherence" do gupaixao, invariante do i915: o hardware nunca arma um SURF cujo buffer
+// nao bate com a CTL/STRIDE armadas). O doador arma PLANE_CTL X-tiled e PLANE_STRIDE 0xF (0x1E com o espelho 4K) enquanto
+// PLANE_SURF aponta o console LINEAR em GGTT 0: no boot o logo sai repetido, no wake o console e lido como X ~140 ms.
+// Adocao: na 1a escrita do doador nos registradores do plano 1 do pipe A, o hardware tem de mostrar o plano do GOP (ligado,
+// LINEAR, STRIDE x 64 == v_rowBytes, SURF 0, PLANE_SIZE do console), em modo grafico sem -v e 32 bpp. Adotado, para sempre:
+//  - CTL/STRIDE com o SURF do hardware em 0 (console): guarda o par do doador e escreve a CTL sem tiling e o STRIDE linear;
+//  - SURF 0 (rearma o console, ex.: wake/desligamento): escreve antes CTL linear e STRIDE linear;
+//  - SURF != 0 por MMIO (superficie propria): escreve antes o par do doador. (O flip do WindowServer vem pela GPU com CTL,
+//    STRIDE e SURF juntos e nao passa por aqui.)
+// O passo 2 (recurso do FB 0 descrito LINEAR) vale enquanto o plano estiver adotado: GGTT 0 fica sempre linear, dos dois lados.
+// -wex-g15-plane-coherence-off desliga. Registro "G15PlaneFix" = {adotado (1) / recusado (0), CTL linear, STRIDE linear,
+// SURF 0 coerente, par do doador devolvido, prova (CTL lida, STRIDE lido, SURF lido)}.
+typedef void (*G15RegWr)(void *,unsigned long,uint32_t);
+static uint32_t g15PcCtl=0,g15PcStride=0,g15PcHave=0,g15PcStat[8]={};
+static volatile uint32_t g15PcHeld=0;          // 1 = o par linear esta no hardware no lugar do par do doador
+static void g15PcPublish(){IORegistryEntry::getRegistryRoot()->setProperty("G15PlaneFix",g15PcStat,sizeof(g15PcStat));}
+static uint32_t g15PcFilter(void *access,unsigned long reg,uint32_t value,G15RegWr wr) {
+ if(!g15PcActive || (reg!=0x70180 && reg!=0x70188 && reg!=0x7019C))return value;
+ if(!g15PcAccess)g15PcAccess=access;
+ const uint32_t lin=static_cast<uint32_t>(PE_state.video.v_rowBytes/64);
+ if(g15PcActive<0) {
+  uint32_t ctl=~0U,str=~0U,surf=~0U,size=~0U;
+  if(g15PcRead){ctl=g15PcRead(access,0x70180);str=g15PcRead(access,0x70188);surf=g15PcRead(access,0x7019C);size=g15PcRead(access,0x70190);}
+  const uint32_t want=static_cast<uint32_t>(((PE_state.video.v_height-1)<<16)|(PE_state.video.v_width-1));
+  g15PcStat[5]=ctl;g15PcStat[6]=str;g15PcStat[7]=surf;
+  g15PcActive=checkKernelArgument("-wex-g15-131") && !checkKernelArgument("-wex-g15-plane-coherence-off") && !checkKernelArgument("-v") &&
+   PE_state.video.v_display==1 && PE_state.video.v_depth==32 && PE_state.video.v_rowBytes && !(PE_state.video.v_rowBytes&63) &&
+   ctl!=~0U && (ctl&0x80000000U) && !(ctl&0x1C00U) && (str&0x7FF)==lin && surf==0 && (size&0x1FFF1FFFU)==want;
+  g15PcStat[0]=g15PcActive;g15PcPublish();
+  if(!g15PcActive)return value;
+ }
+ if(reg==0x70180 || reg==0x70188) {
+  if(reg==0x70180){g15PcCtl=value;g15PcHave|=1;}else{g15PcStride=value;g15PcHave|=2;}
+  const uint32_t surf=g15PcRead?g15PcRead(access,0x7019C):~0U;
+  if(surf==0) {                                  // console no ar: segura o par do doador, escreve o par linear
+   if(reg==0x70180 && (value&0x1C00U)){value&=~0x1C00U;g15PcStat[1]++;g15PcHeld=1;}
+   if(reg==0x70188 && value!=lin){value=lin;g15PcStat[2]++;g15PcHeld=1;}
+  }
+ } else if(!value) {                             // SURF 0: o console volta a ser lido como LINEAR
+  if(wr){wr(access,0x70180,(g15PcHave&1?g15PcCtl:(g15PcRead?g15PcRead(access,0x70180):0x80000000U))&~0x1C00U);wr(access,0x70188,lin);g15PcHeld=1;}
+  g15PcStat[3]++;
+ } else {                                        // superficie propria por MMIO: o par do doador antes do SURF
+  if(wr && (g15PcHave&1))wr(access,0x70180,g15PcCtl);
+  if(wr && (g15PcHave&2))wr(access,0x70188,g15PcStride);
+  g15PcHeld=0;g15PcStat[4]++;
+ }
+ if(g15PcStat[1]+g15PcStat[2]+g15PcStat[3]+g15PcStat[4]<=16)g15PcPublish();
+ return value;
+}
+// O 1o quadro do WindowServer (e todo flip) chega pela GPU so com o SURF: sem isto o plano seguia com o par linear e a
+// superficie X do WindowServer era lida como linear (logo repetido ~1 s). Antes de cada PerformFlipTransaction, com o par
+// linear no hardware, escreve o par do doador por MMIO: CTL/STRIDE sao armados so pelo proximo SURF (o do flip), entao o
+// console continua linear ate a troca. Registro G15PlaneFix[4] conta tambem estas devolucoes.
+static mach_vm_address_t g15OrgFlip=0;
+static G15RegWr g15PcWrite=nullptr;
+static int g15FlipHook(void *fb,void *trans,uint64_t arg,void *params) {
+ const uint32_t held=g15PcHeld,s0=g15HwSurf(),c0=(g15PcAccess && g15PcRead)?g15PcRead(g15PcAccess,0x70180):~0U;
+ if(g15PcHeld && g15PcAccess && g15PcWrite) {
+  if(g15PcHave&1)g15PcWrite(g15PcAccess,0x70180,g15PcCtl);
+  if(g15PcHave&2)g15PcWrite(g15PcAccess,0x70188,g15PcStride);
+  g15PcHeld=0;g15PcStat[4]++;g15PcPublish();
+ }
+ const int ret=reinterpret_cast<int (*)(void *,void *,uint64_t,void *)>(g15OrgFlip)(fb,trans,arg,params);
+ if(g15FlipLogN<12){char line[160];const uint32_t s1=g15HwSurf(),c1=(g15PcAccess && g15PcRead)?g15PcRead(g15PcAccess,0x70180):~0U;
+  snprintf(line,sizeof(line),"%u ms segurando %u surf %x->%x ctl %x->%x doador %x/%x ret %x",g15UpMs(),held,s0,s1,c0,c1,g15PcCtl,g15PcStride,ret);
+  g15DiagLine("G15FlipLog",g15FlipLogN,line);}
+ return ret;
+}
+__attribute__((noinline)) static void g15PcBoot(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size,mach_vm_address_t wr) {
+ if(!checkKernelArgument("-wex-g15-131") || checkKernelArgument("-wex-g15-plane-coherence-off")){g15PcActive=0;return;}
+ g15PcWrite=reinterpret_cast<G15RegWr>(wr);
+ KernelPatcher::RouteRequest route("__ZN21AppleIntelFramebuffer22PerformFlipTransactionEP30IOAccelDisplayPipeTransaction2yP21FlipTransactionParams",g15FlipHook,g15OrgFlip);
+ const bool ok=wr && patcher.routeMultiple(index,&route,1,address,size);
+ patcher.clearError();
+ IORegistryEntry::getRegistryRoot()->setProperty("G15PlaneFlipHook",ok);
+ if(!ok)g15PcActive=0;                           // sem o gancho do flip o passo 1 nao e seguro: fica recusado
+}
 __attribute__((noinline)) static void g15PsrBoot(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size,bool fastWrRouted) {
  uint32_t psr=0;
  if(!PE_parse_boot_argn("wexg15psr",&psr,sizeof(psr)))return;
@@ -3602,7 +3800,12 @@ __attribute__((noinline)) static void g15PsrBoot(KernelPatcher &patcher,size_t i
   if(patcher.routeMultiple(index,&dcWr,1,address,size))hooks|=2;
   patcher.clearError();
  }
+ g15FbBase=address;
+ KernelPatcher::RouteRequest vbl("__ZN31AppleIntelFramebufferController15hwWaitForVBlankEP21AppleIntelFramebufferj",g15WaitVbl,g15OrgWaitVbl);
+ if(patcher.routeMultiple(index,&vbl,1,address,size))hooks|=4;
+ patcher.clearError();
  g15DcHooks=hooks;
+ sysctl_register_oid(&sysctl__debug_g15vbl);
 }
 // Com o PSR desligado e o DC fora (chamado com o g15PsrLock e o spinlock). 0 = carregado e conferido.
 static int g15DmcLoad() {
@@ -3734,7 +3937,7 @@ static int g15PsrSysctlMode SYSCTL_HANDLER_ARGS {
 }
 static int g15PsrSysctlInfo SYSCTL_HANDLER_ARGS {
  (void)arg1;(void)arg2;(void)oidp;
- char buf[900];int n;
+ char buf[1200];int n;
  IOLockLock(g15PsrLock);
  if(!g15Psr.ctl || !g15Psr.rd)n=snprintf(buf,sizeof(buf),"modo=0x%x sem controlador (falta um modeset do eDP)",g15PsrMode);
  else {
@@ -3754,6 +3957,9 @@ static int g15PsrSysctlInfo SYSCTL_HANDLER_ARGS {
   "blocks=%u allows=%u mis=%u [%x:%08x>%08x %x:%08x>%08x] espera=%u dmc=%d p0=%08x",g15DcArmed,g15DcOn,g15DcBad,g15DcState,g15DcHooks,
   g15DcBase!=nullptr,g15DcBlocks,g15DcAllows,g15DcMis,g15DcMisLog[0],g15DcMisLog[1],g15DcMisLog[2],g15DcMisLog[3],g15DcMisLog[4],
   g15DcMisLog[5],g15DcWaitMax,g15DmcResult,g15DcBase?g15DcRd(0x80000):0);
+ if(n>0 && n<static_cast<int>(sizeof(buf))-160)n+=snprintf(buf+n,sizeof(buf)-n," | vbl chute=%u esperas=%u chutes=%u frm=%u quem=%x:%u %x:%u %x:%u %x:%u",
+  g15VblKick,g15VblWaits,g15VblKicks,(g15Psr.ctl && g15Psr.rd)?g15PsrR(0x70040):0,g15VblWho[0],g15VblWhoN[0],g15VblWho[1],g15VblWhoN[1],
+  g15VblWho[2],g15VblWhoN[2],g15VblWho[3],g15VblWhoN[3]);
  IOLockUnlock(g15PsrLock);
  if(n<0)n=0;if(n>=static_cast<int>(sizeof(buf)))n=sizeof(buf)-1;
  return SYSCTL_OUT(req,buf,n+1);
@@ -12396,6 +12602,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			patcher.clearError();
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLCPSColorPipeReady",cpsOK);
+			g15FbResBoot(patcher,index,address,size); // G15 #131: console do GOP descrito LINEAR
 			// Linux Gen12 Wa_18022495364: an INDIRECT_CTX cache invalidation,
 			// distinct from ring PIPE_CONTROL. Keep the per-context batch intact.
 			bool contextCacheOK=!contextCacheRequested;
@@ -13875,6 +14082,7 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
      adlsDC6On=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController11enableHWDC6Ev",address,size);
      adlsDC6Off=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController12disableHWDC6Ev",address,size);
      g15PsrBoot(patcher,index,address,size,orgTGLFastRegisterWrite!=0); // G15 PSR: so com o boot-arg wexg15psr
+     g15PcBoot(patcher,index,address,size,orgTGLRegisterWrite); // G15 #131 passo 1: par do doador antes de cada flip
      patcher.clearError();
      bool smReady=adlsPanelPowerFn && orgTGLRegisterRead;
      if(smReady) {
@@ -20428,6 +20636,8 @@ void XE::tglObserveScanout(void *fb, void *plane, uint32_t event, bool done, uin
 // returned and released its native register lock. Upload and readback stay separate.
 void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
 	g15DcTouch(reg); // G15: DC por software
+	g15PcRead = reinterpret_cast<G15RegRd>(callbackXE->orgTGLRegisterRead);
+	value = g15PcFilter(access, reg, value, reinterpret_cast<G15RegWr>(callbackXE->orgTGLRegisterWrite)); // G15 #131 passo 1
 	// G15 PSR: sai antes de qualquer escrita que desligue pipe/DDI/DP_TP/painel ou mexa no CDCLK; mantem o PIPE_MISC[20].
 	if (g15PsrOn && (((reg == 0x70008 || reg == 0x64000 || reg == 0x60540) && !(value & 0x80000000U)) ||
 		(reg == 0xC7204 && !(value & 1)) || reg == 0x46000 || reg == 0x46070)) g15PsrSourceOff(4);
@@ -20551,6 +20761,8 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
 
 void XE::wrapTGLFastRegisterWrite(void *access, unsigned long reg, uint32_t value) {
 	g15DcTouch(reg); // G15: DC por software
+	g15PcRead = reinterpret_cast<G15RegRd>(callbackXE->orgTGLRegisterRead);
+	value = g15PcFilter(access, reg, value, reinterpret_cast<G15RegWr>(callbackXE->orgTGLFastRegisterWrite)); // G15 #131 passo 1
 	tglProgramRecord(access, reg, value, 1, __builtin_return_address(0));
 	tglStreamAck(access, reg, value, 1, __builtin_return_address(0));
 	auto irq=reg==0x190010 ? tglFBIRQBegin(0,callbackXE->tglObservationController,value,

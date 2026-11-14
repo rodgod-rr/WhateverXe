@@ -79,8 +79,27 @@ from the G15 changes:
 - boot_arguments: `wexblmin`/`wexblmax` do not start with `-wex`.
 The tests were not updated.
 
+## Later changes in the same branch (11-14 Nov)
+
+- **Power in sleep:** solved. Overnight on battery the package stays in PC10 ~100% of the time, about 0.9-1.0 W
+  (the earlier 19 W came from RC6 being stopped by the AGPM profile, see #87, and from the RTX path).
+- **Execution forcewake** (`g15ExecWake`): render forcewake is held while an engine executes and released as soon as it is
+  idle, for every engine (`-wex-g15-execwake-off` to disable). A still screen stays at about 1.2-1.7 W of package power.
+- **Hang log:** each GPU restart writes per-engine scheduler state, registers and the CSB to
+  `/private/var/log/g15-uhd-hang-*.txt` (FileIO through Lilu, because IOLog of an injected kext does not reach `log show`).
+  `sudo sysctl debug.g15hang=1` writes one on demand.
+- **eDP PSR1 (optional, `wexg15psr=3`):** hardware-tracked PSR1 for the internal panel, AUX A power held while it is on;
+  with a still screen the package goes from about 2.05 W to 1.17 W. Runtime control with `sysctl debug.g15psr`.
+- **Vblank waits with PSR active:** `hwWaitForVBlank` waits for the pipe frame counter, which stops while the panel is in
+  PSR, so each wait timed out after 500 ms ("Wait for VBL timed out" twice a second, and the first frame after a still
+  screen was delayed). A hook on `AppleIntelFramebufferController::hwWaitForVBlank` forces a PSR exit (write to
+  `CURSURFLIVE` of pipe A, as i915 does) before the wait. Most waits come from `PerformFlipTransaction`. No measurable
+  power cost (PSR residency still 97%). `sysctl debug.g15vbl=0` turns it off; counters in `debug.g15psr_info`.
+- **#131 (boot logo repeated):** an experimental port of gupaixao's two steps is in the code but **off by default**
+  (`-wex-g15-131`): on this unit `accel+0xF28` is 0x80000003 and every variant made the repeat longer. With the vblank
+  hook above the repeat is down to a few frames.
+
 ## Not solved
 
-Power while asleep is about 19 W here (from a 100% -> 36% drop over 1 h 44 min). The RTX 4050 is powered off during
-sleep by an ACPI `_OFF` (separate kext), and in October the same setup with the iGPU unaccelerated measured about 3-5 W.
-The cause is not isolated yet.
+- A rare UHD hang still happens (one on 14/11 after ~14 min of uptime: BCS context stuck, no GPU interrupt after any of
+  the resets, WindowServer watchdog).
