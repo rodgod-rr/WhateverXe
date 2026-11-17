@@ -99,7 +99,32 @@ The tests were not updated.
   (`-wex-g15-131`): on this unit `accel+0xF28` is 0x80000003 and every variant made the repeat longer. With the vblank
   hook above the repeat is down to a few frames.
 
+## Later changes in the same branch (15-17 Nov)
+
+- **UHD hang under GPU compute (fixed): `-wex-g15-noccs`.** Random full GPU hangs (WindowServer watchdog reboot) came
+  from Apple's ML frameworks running compute on the GPU (Preview Live Text, `mediaanalysisd`, `photoanalysisd`), worse
+  while the GPU was also drawing. Signature: CCS stuck in a `GPGPU_WALKER` batch, RCS stopped in a context restore
+  (`GPGPU_CSR_BASE_ADDRESS`), no fault. Intel's TGL PRM Vol 14 (Gen12 LP) has the workaround *"SVSM: Dual Context -
+  Invalidate hang"*: CCS and RCS must not run in parallel. i915 never uses the CCS on Gen12 LP; Apple turns it on from
+  `AppleIntelTGLGraphics`' `Info.plist` (`EnableMultiContext = 1`; the code default is 0). With `-wex-g15-noccs` the key
+  read in `IntelAccelerator::populateAccelConfig` is renamed so it reads 0: the log says
+  `Multi-Context (Compute Command Streamer) Disabled!` and compute runs on the RCS, as on Linux. No hang since, including
+  the PDF test that hung 7+ times in an afternoon. Registry `G15NoCCS`.
+- **CCS reset and ban (diagnostics, kept):** the RCS reset also resets the CCS (`G15CcsReset`, `-wex-g15-ccsreset-off`
+  disables, `-wex-g15-ccsreset-sw` = software restore of 4 registers, which left the CCS idle: not recommended); the task
+  whose CCS context hung is banned for 2 minutes and its pending requests complete as done. Not needed with
+  `-wex-g15-noccs`; recommended boot-args: `-wex-g15-noccs -wex-g15-ccsreset-off`.
+- **Engine workarounds from i915 (`G15GtWa`, on by default, `-wex-g15-gtwa-off`):** `rcs_engine_wa_init` entries for
+  TGL/ADL-S that Apple's driver does not set on this GPU (all read as off): `GEN7_FF_THREAD_MODE` bit 19,
+  `GEN8_ROW_CHICKEN2` bit 8, `GEN9_ROW_CHICKEN4` bit 9, `GEN10_SAMPLER_MODE` bit 15, written at each RCS CSB init (first
+  submit, wake, after a GPU reset) with MCR multicast.
+- **GSYNC / FFDOP / MOCS after a reset (`-wex-g15-gsync`):** GSYNC off and the registers restored after the reset
+  (PRM TGL Vol 14).
+- **`sysctl debug.g15edp_recover=1`:** calls Apple's `AppleIntelFramebuffer::recoverDPLink` on the eDP framebuffer
+  (registry `G15MuxRecover`). Used when the panel comes back from the other GPU through the laptop's display mux
+  (PS8461E): one blink instead of a frozen image.
+- **#131:** gupaixao's plane coherence step (`kern_adls_plane_coherence.hpp`) is in the code, only with `-wex-g15-131`.
+
 ## Not solved
 
-- A rare UHD hang still happens (one on 14/11 after ~14 min of uptime: BCS context stuck, no GPU interrupt after any of
-  the resets, WindowServer watchdog).
+- The rare UHD hangs of 14/11 were the CCS/RCS case above: fixed with `-wex-g15-noccs` (see 15-17 Nov).

@@ -576,6 +576,9 @@ private:
 	static void tglObserveCursorLifetime(void *controller, void *fb, void *info, uint32_t event, uint32_t result);
 
 	static void wrapTGLPlaneSetup(void *plane, void *path);
+	static bool adlsPlaneIsPrimaryA(void *plane, void *fb);
+	static void adlsPlaneCoherenceSetup(void *plane, void *fb, bool done);
+	static uint32_t adlsPlaneCoherenceWrite(void *access, unsigned long reg, uint32_t value, bool fast, void *caller);
 	static void wrapTGLColorMode(void *controller, void *fb, void *path, uint32_t mode, uint32_t depth, bool flag, const void *timing);
 	static uint32_t wrapTGLPixelInfo(void *fb, int mode, int depth, int aperture, void *info);
 	static bool wrapTGLScanoutAllocate(void *fb);

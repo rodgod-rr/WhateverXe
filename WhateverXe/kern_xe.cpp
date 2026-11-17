@@ -55,6 +55,8 @@
 #include "kern_tgl_port_map.hpp"
 #include "kern_adls_clock.hpp"
 #include "kern_adls_boot.hpp"
+#include "kern_adls_plane_coherence.hpp"
+#include <pexpert/i386/boot.h>
 #include "kern_tgl_combo_signal.hpp"
 #include "kern_tgl_panel_depth.hpp"
 #include "kern_xelp_panel_power.hpp"
@@ -3167,6 +3169,14 @@ uint32_t tglConnectionCaller(void *caller) {
 constexpr uint32_t tglProgramCapacity = 512;
 struct TGLProgramRecord { uint64_t q[8]; };
 IOSimpleLock *tglProgramLock;
+// ADL-S plane 1A coherence state (kern_adls_plane_coherence.hpp). The lock only surrounds the pure decision.
+static IOSimpleLock *adlsPlaneLock {};
+static ADLSPlaneCoherence::State adlsPlaneState {};
+static ADLSPlaneCoherence::Video adlsBootVideo {};
+static volatile bool adlsPlaneFilterActive {};
+static bool adlsPlaneCoherenceEnabled {};
+struct ADLSPlanePending {void *plane;thread_t thread;ADLSPlaneCoherence::Shadow pre,post;bool valid;};
+static ADLSPlanePending adlsPlanePending {};
 // Keep the same binary, allocations and native hooks for observer A/B trials.
 // Disabled means no timestamp/copy/IRQ lock on writes; not an r64-equivalent ABI
 // or a claim that the remaining wrapper/observers are timing-neutral.
@@ -3674,7 +3684,7 @@ static void *g15FbRes(void *pipe,uint32_t fbIndex,void *resource) {
  if(PE_state.video.v_display!=1 || checkKernelArgument("-v"))why|=0x200;
  if(tiling!=2)why|=0x400;
  if(r108&(1U<<27))why|=0x800;
- if(g15PcActive!=1)why|=0x1000;                 // so com o plano do console adotado (passo 1): GGTT 0 linear dos dois lados
+ if(!g15BootWindow())why|=0x1000;               // so no boot (o passo 1 nosso, g15PcActive, fica desligado)
  // (14/11, registro do boot) Aqui o accel+0xF28 = 0x80000003 e o console tambem vai para um recurso ESCALADO (memoria
  // propria, GGTT != 0, mesma geometria) descrito X: as superficies do WindowServer copiavam dele e mostravam 8 macas por ~1 s.
  // Teste: tambem esse recurso vira LINEAR, so com o plano do console adotado e ainda no ar (SURF 0) e nos 2 min do boot.
@@ -3691,6 +3701,7 @@ static void *g15FbRes(void *pipe,uint32_t fbIndex,void *resource) {
 }
 __attribute__((noinline)) static void g15FbResBoot(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
  // 14/11: nenhuma versao do #131 resolveu aqui (usuario pediu voltar): tudo do #131 so com -wex-g15-131 (teste).
+ // 14/11 noite: com o passo 1 do gupaixao o logo repetiu por mais tempo; tudo do #131 so com -wex-g15-131.
  if(!checkKernelArgument("-wex-g15-131") || checkKernelArgument("-wex-g15-fbres-linear-off") || size<0x7F440)return;
  const uint8_t head[]{0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53};
  const uint8_t tilingStore[]{0x45,0x89,0xAF,0x94,0x01,0,0};
@@ -4041,6 +4052,55 @@ static void g15PsrInit(uint32_t mode) {
  sysctl_register_oid(&sysctl__debug_g15psr);sysctl_register_oid(&sysctl__debug_g15psr_info);
  sysctl_register_oid(&sysctl__debug_g15psr_sink);sysctl_register_oid(&sysctl__debug_g15reg);sysctl_register_oid(&sysctl__debug_g15dpcd);
  SYSLOG("igfx","G15PSR pronto modo=0x%x",mode);
+}
+
+// G15 (17/11): mux de tela PS8461E (docs/GMUX-G15.md, no repositorio hackintosh-g15). O mux devolve o painel a UHD
+// sem HPD (como o Windows exige do mux), entao nada aqui percebe a volta e a imagem fica parada ate um modeset.
+//   sysctl debug.g15edp_recover=1   (sem sudo) chama o AppleIntelFramebuffer::recoverDPLink() da propria Apple no FB do
+//   eDP (location "0"), no workloop dele: disableDisplay + hwSetMode no mesmo modo + RestoreTransactions. E o caminho
+//   da Apple para "Link loss occurred" (connectionHandleDisplayPortEvent), o equivalente ao reprobe() do i915 e ao
+//   PostSwitchTo do Windows. Leitura: 0 = nunca pedido; senao 1000 + pedidos (e -1 sem o simbolo, -2 sem o FB).
+static mach_vm_address_t g15RecoverDPLinkFn=0;
+static int g15MuxCount=0;
+static IOReturn g15MuxRecoverAction(OSObject *o,void *,void *,void *,void *) {
+ reinterpret_cast<void (*)(void *)>(g15RecoverDPLinkFn)(o);
+ return kIOReturnSuccess;
+}
+static IOService *g15MuxEdpFb() {
+ auto m=IOService::serviceMatching("AppleIntelFramebuffer");
+ auto it=m?IOService::getMatchingServices(m):nullptr;
+ OSSafeReleaseNULL(m);
+ IOService *fb=nullptr;
+ while(it && !fb){
+  auto sv=OSDynamicCast(IOService,it->getNextObject());
+  if(!sv)break;
+  const char *l=sv->getLocation();
+  if(l && !strcmp(l,"0")){fb=sv;fb->retain();}
+ }
+ OSSafeReleaseNULL(it);
+ return fb;
+}
+static int g15MuxSysctl SYSCTL_HANDLER_ARGS {
+ (void)arg1;(void)arg2;
+ int v=g15MuxCount;
+ const int e=sysctl_handle_int(oidp,&v,0,req);
+ if(e || !req->newptr)return e;
+ if(!g15RecoverDPLinkFn){g15MuxCount=-1;return ENOENT;}
+ auto fb=g15MuxEdpFb();
+ if(!fb){g15MuxCount=-2;return ENOENT;}
+ auto wl=fb->getWorkLoop();
+ const IOReturn r=wl?wl->runAction(g15MuxRecoverAction,fb):g15MuxRecoverAction(fb,nullptr,nullptr,nullptr,nullptr);
+ fb->release();
+ g15MuxCount=(g15MuxCount>=1000?g15MuxCount:1000)+1;
+ SYSLOG("igfx","G15MUX recoverDPLink no FB0 (workloop %d) r=0x%x pedidos=%d",wl?1:0,r,g15MuxCount-1000);
+ return 0;
+}
+SYSCTL_PROC(_debug,OID_AUTO,g15edp_recover,CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY|CTLFLAG_LOCKED,nullptr,0,g15MuxSysctl,"I","");
+__attribute__((noinline)) static void g15MuxBoot(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ g15RecoverDPLinkFn=patcher.solveSymbol(index,"__ZN21AppleIntelFramebuffer13recoverDPLinkEv",address,size);
+ patcher.clearError();
+ sysctl_register_oid(&sysctl__debug_g15edp_recover);
+ IORegistryEntry::getRegistryRoot()->setProperty("G15MuxRecover",g15RecoverDPLinkFn!=0);
 }
 
 // Native DPCD records exclude EDID transactions, which otherwise exhaust the
@@ -4979,6 +5039,15 @@ bool XE::xelpInstallHostRPS(KernelPatcher &patcher,size_t index,mach_vm_address_
 }
 
 void XE::processKernel(KernelPatcher &patcher, DeviceInfo *info) {
+	// Console geometry handed over by boot.efi (boot_args.Video, immutable, read only). Plane coherence adopts the
+	// GOP plane only if pitch, size, depth and graphics mode agree with it.
+	if (auto pe = reinterpret_cast<PE_state_t *>(patcher.solveSymbol(KernelPatcher::KernelID, "_PE_state"))) {
+		if (auto args = static_cast<boot_args *>(pe->bootArgs))
+			adlsBootVideo = {args->Video.v_display, args->Video.v_rowBytes, args->Video.v_width,
+				args->Video.v_height, args->Video.v_depth, false};
+	}
+	patcher.clearError();
+	adlsBootVideo.verbose = checkKernelArgument("-v");
 	// This must precede tglLoadHDMIWiring, tglPrepareMMIOUC and TGL FIA reads.
 	auto physicalGPU = OSDynamicCast(IOPCIDevice, info->videoBuiltin);
 	selectProfile(XELP::deviceProfile(physicalGPU));
@@ -13550,6 +13619,10 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
                 IORegistryEntry::getRegistryRoot()->setProperty("ADLSPortInitReady",adlsPortInitReady);
                 patcher.clearError();
             }
+			if(adlsDisplaySelected) {
+				adlsPlaneLock=IOSimpleLockAlloc();
+				adlsPlaneCoherenceEnabled=adlsPlaneLock && checkKernelArgument("-wex-g15-131") && !checkKernelArgument("-wex-g15-plane-coherence-off"); // 14/11: o passo 1 do gupaixao repetiu o logo por mais tempo aqui: so com -wex-g15-131
+			}
 			{
 				KernelPatcher::RouteRequest routes[] {
 					{"__ZN17AppleIntelPortHAL14enableComboPhyEv", wrapTGLEnableCombo, orgTGLEnableCombo},
@@ -14082,6 +14155,7 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
      adlsDC6On=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController11enableHWDC6Ev",address,size);
      adlsDC6Off=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN31AppleIntelFramebufferController12disableHWDC6Ev",address,size);
      g15PsrBoot(patcher,index,address,size,orgTGLFastRegisterWrite!=0); // G15 PSR: so com o boot-arg wexg15psr
+     g15MuxBoot(patcher,index,address,size); // G15 mux PS8461E: sysctl debug.g15edp_recover (recoverDPLink da Apple)
      g15PcBoot(patcher,index,address,size,orgTGLRegisterWrite); // G15 #131 passo 1: par do doador antes de cada flip
      patcher.clearError();
      bool smReady=adlsPanelPowerFn && orgTGLRegisterRead;
@@ -15815,6 +15889,35 @@ struct TGLCSBIO {
  }
 };
 
+// G15 (14/11, hang da UHD): workarounds de motor do i915 (rcs_engine_wa_init, tgl/rkl/adl-s) que o driver TGL da Apple nao
+// aplica nesta GPU (lidos no hardware: todos desligados). Sao correcoes de travamento/corrupcao do pipeline 3D; o hang de
+// 12/11 parou o RCS restaurando estado 3D. Gravados a cada tglCSBInitialize do RCS (antes da 1a submissao, no wake e na
+// reposicao depois de um reset da GPU), com forcewake dos 3 dominios e as escritas MCR em multicast (GEN8_MCR_SELECTOR
+// 0xFDC bit 31, como o intel_gt_mcr do i915 no Gen11/12), devolvendo o seletor depois.
+//   GEN7_FF_THREAD_MODE 0x20A0 |= bit 19 (GEN12_FF_TESSELATION_DOP_GATE_DISABLE)  Wa_14010919138 / Wa_18011464164
+//   GEN8_ROW_CHICKEN2   0xE4F4 masked bit 8 (GEN12_PUSH_CONST_DEREF_HOLD_DIS)       Wa_1409804808
+//   GEN9_ROW_CHICKEN4   0xE48C masked bit 9 (GEN12_DISABLE_TDL_PUSH)                 Wa_14010229206
+//   GEN10_SAMPLER_MODE  0xE18C masked bit 15 (ENABLE_SMALLPL)                        Wa_1406941453
+// Registro "G15GtWa" = {aplicacoes, 0x20A0, 0xE4F4, 0xE48C, 0xE18C lidos depois}. -wex-g15-gtwa-off desliga.
+static uint32_t g15GtWaStat[5]={};
+static void g15GtWa(TGLCSBIO &io) {
+ static int off=-1;if(off<0)off=checkKernelArgument("-wex-g15-gtwa-off");
+ if(off || io.engine!=0)return;
+ io.acquire();
+ auto r=[&](uint32_t a){return *reinterpret_cast<volatile uint32_t *>(io.bar+a);};
+ auto w=[&](uint32_t a,uint32_t v){*reinterpret_cast<volatile uint32_t *>(io.bar+a)=v;(void)*reinterpret_cast<volatile uint32_t *>(io.bar+a);};
+ const uint32_t ff=r(0x20A0);
+ if(ff!=~0U)w(0x20A0,ff|(1U<<19));
+ const uint32_t sel=r(0xFDC);
+ if(sel!=~0U)w(0xFDC,sel|0x80000000U);
+ w(0xE4F4,(1U<<24)|(1U<<8));
+ w(0xE48C,(1U<<25)|(1U<<9));
+ w(0xE18C,(1U<<31)|(1U<<15));
+ if(sel!=~0U)w(0xFDC,sel);
+ g15GtWaStat[0]++;g15GtWaStat[1]=r(0x20A0);g15GtWaStat[2]=r(0xE4F4);g15GtWaStat[3]=r(0xE48C);g15GtWaStat[4]=r(0xE18C);
+ IORegistryEntry::getRegistryRoot()->setProperty("G15GtWa",g15GtWaStat,sizeof(g15GtWaStat));
+}
+
 void tglCSBInitialize(void *streamer,uint32_t flags=0) {
  TGLCSBIO io(streamer,flags);auto &engine=tglCSBEngines[io.engine];
  // Called before the first submission, wake reset, or GPU-reset replay. Never
@@ -15823,6 +15926,7 @@ void tglCSBInitialize(void *streamer,uint32_t flags=0) {
  engine.modeAtInit=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
  *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=engine.state.head;
  engine.hardwareReady=true;++engine.resets;
+ g15GtWa(io);
 }
 
 bool tglCSBModeSerialize(void *,void *,OSSerialize *serializer) {
@@ -15860,6 +15964,14 @@ static volatile uint64_t g15WillSleepN=0,g15DidWakeN=0,g15ResetWakeN=0,g15WillSl
 static void g15SnapAll(unsigned phase);
 static void g15SaveActive();
 static mach_vm_address_t g15OrgCheckProgress=0;static uint32_t g15UnstickMask=0;
+// G15 (16/11): reset do CCS junto com o do RCS (ver g15WrapResetEngine).
+static mach_vm_address_t g15OrgResetEngine=0,g15GetDefaultReset=0,g15StreamerReset=0;static bool g15CcsResetOff=false;
+static volatile uint32_t g15CcsResetN=0;static bool g15WrapResetEngine(void *ring,void *ctx);
+static bool g15CcsSwReset=false;static struct {uint8_t *ring;unsigned n;uint32_t reg[16],val[16];bool masked[16];} g15PairSnap[2];
+static uint32_t g15RcuSnap[1+24];static uint32_t g15RcuSnap2[2+32];static bool g15GsyncOn=false;static volatile uint32_t g15GsyncN=0;static bool g15RcuSnapOk=false;static volatile uint32_t g15RcuFixN=0;
+static struct {uint32_t reg,val;uint8_t masked;} g15CcsSnap[16];static unsigned g15CcsSnapN=0;static uint8_t *g15CcsSnapRing=nullptr;static uint64_t g15CcsSnapT=0;
+static uint8_t *g15CcsItemCtx(uint8_t *st,unsigned list,unsigned j);static bool g15CcsOurs=false;static uint32_t g15CcsQuietMs=0;static uint32_t g15CcsQuietCheckMs=0;static uint64_t g15CcsQuietCheckT=0;
+static mach_vm_address_t g15CtxBeginReset=0,g15CtxEndReset=0,g15CtxUpdateTail=0,g15RingReset=0,g15RingStamp=0;
 static bool g15WrapCheckProgress(void *schedObj,uint32_t cs);
 static void g15HangSysctlRegister();
 // G15 (12/11): energia de render durante TODA a execucao no RCS. O 1o hang da UHD com registro (07:31:59) mostrou o ultimo
@@ -15973,6 +16085,40 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   KernelPatcher::RouteRequest g15p[] {{"__ZN12IGScheduler516checkForProgressE10IGHwCsType",g15WrapCheckProgress,g15OrgCheckProgress}};
   const bool pok=patcher.routeMultiple(index,g15p,1,address,size);patcher.clearError();
   PE_parse_boot_argn("wexg15unstick",&g15UnstickMask,sizeof(g15UnstickMask));
+  // G15 (16/11): o reset do RCS zera tambem o CCS; ver g15WrapResetEngine. -wex-g15-ccsreset-off desliga.
+  g15CcsResetOff=checkKernelArgument("-wex-g15-ccsreset-off");
+  // 16/11 19:04: a restauracao por software do CCS (4 registradores) deixa o CCS sem executar nada; fica so com este boot-arg.
+  // Sem ele, o CCS passa pelo reset completo da propria Apple (detectado sem progresso), e o banimento age nesse reset.
+  g15CcsSwReset=checkKernelArgument("-wex-g15-ccsreset-sw");
+  g15GsyncOn=checkKernelArgument("-wex-g15-gsync");
+  // 16/11 21:00 (PRM TGL Vol14, "SVSM: Dual Context - Invalidate hang": o escalonador tem de garantir que CCS e RCS nao
+  // rodem em paralelo; invalidar o state cache com o sampler ativo trava). O i915 nunca usa o CCS no TGL; a Apple liga
+  // pelo Info.plist (EnableMultiContext=1; padrao do codigo 0). Com -wex-g15-noccs a chave lida em populateAccelConfig
+  // vira "EnableMultiContexX" (nao existe -> 0): "Multi-Context (Compute Command Streamer) Disabled!", compute no RCS.
+  if(checkKernelArgument("-wex-g15-noccs")) {
+   static const uint8_t f[]="EnableMultiContext",r[]="EnableMultiContexX";
+   auto site=reinterpret_cast<uint8_t *>(address+0x94AC6);
+   bool ok=currentGraphics && size>0x94AC6+sizeof(f) && !memcmp(site,f,sizeof(f));
+   if(ok) {
+    KernelPatcher::LookupPatch patch {currentGraphics,f,r,sizeof(f),1};
+    patcher.applyLookupPatch(&patch,site,sizeof(f)+1);
+    ok=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(site,r,sizeof(r));
+   }
+   patcher.clearError();
+   IORegistryEntry::getRegistryRoot()->setProperty("G15NoCCS",ok);
+  }
+  g15GetDefaultReset=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator20getDefaultResetValueEj",address,size);patcher.clearError();
+  // endereco do processGPUReset do streamer: com a rota instalada mais abaixo, chamar ali passa pelo wrapTGLCSBReset
+  g15StreamerReset=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN26IGHardwareCommandStreamer515processGPUResetEv",address,size);patcher.clearError();
+  KernelPatcher::RouteRequest g15r[] {{"__ZN20IGHardwareRingBuffer19resetGraphicsEngineEP17IGHardwareContext",g15WrapResetEngine,g15OrgResetEngine}};
+  { // G15 (16/11): rotinas do processGPUReset da Apple, para pular o trabalho de um contexto banido do CCS (g15BanSkip)
+   const char *nm[5]={"__ZN17IGHardwareContext10beginResetEv","__ZN17IGHardwareContext8endResetEv","__ZN17IGHardwareContext14updateRingTailEj",
+    "__ZN20IGHardwareRingBuffer9resetRingEv","__ZN20IGHardwareRingBuffer19resubmitStampToRingEjPj"};
+   mach_vm_address_t *dst[5]={&g15CtxBeginReset,&g15CtxEndReset,&g15CtxUpdateTail,&g15RingReset,&g15RingStamp};
+   for(unsigned i=0;i<5;++i){*dst[i]=g15CcsResetOff?0:patcher.solveSymbol<mach_vm_address_t>(index,nm[i],address,size);patcher.clearError();}
+  }
+  const bool rok=!g15CcsResetOff && g15GetDefaultReset && g15StreamerReset && patcher.routeMultiple(index,g15r,1,address,size);patcher.clearError();
+  uint32_t rv[2]={rok,0};IORegistryEntry::getRegistryRoot()->setProperty("G15CcsReset",rv,sizeof(rv));
   uint32_t pv[2]={pok,g15UnstickMask};IORegistryEntry::getRegistryRoot()->setProperty("G15Progress",pv,sizeof(pv));
   g15HangSysctlRegister();
  }
@@ -16314,6 +16460,13 @@ static bool g15WrapCheckProgress(void *schedObj,uint32_t cs) {
  static volatile uint32_t calls=0;const uint32_t n=__sync_add_and_fetch(&calls,1);
  const uint64_t sw0=g15SWIrqN,hw0=g15HWIrqN,csb0=g15CSBTotal;const bool log=n<=48;
  if(log)g15LogSched("antes",n,cs);
+ { // G15 (16/11): silencio do CCS NA DETECCAO (as etapas do reset geram CSB e mascaram o hang; ver g15CcsBanFromReset)
+  // so conta com um pedido na lista em execucao do CCS (ocioso sem trabalho tambem fica sem CSB)
+  auto x=static_cast<uint8_t *>(tglCSBEngines[1].streamer);
+  const bool busy=x && *reinterpret_cast<void **>(x+0x30+(*reinterpret_cast<uint32_t *>(x+0x50)&1)*16);
+  const uint64_t q=!busy?0:g15LastCSBT[1]?g15Since(g15LastCSBT[1])/1000:UINT32_MAX;
+  g15CcsQuietCheckMs=q>UINT32_MAX?UINT32_MAX:static_cast<uint32_t>(q);g15CcsQuietCheckT=mach_absolute_time();
+ }
  const bool ok=reinterpret_cast<bool (*)(void *,uint32_t)>(g15OrgCheckProgress)(schedObj,cs);
  {
   clock_sec_t sec=0;clock_usec_t usec=0;clock_get_calendar_microtime(&sec,&usec);
@@ -16408,10 +16561,251 @@ static void g15LogResetState(void *resetStreamer) {
    static_cast<unsigned>(eng.state.error),(unsigned)g15GpuAsleep);
  }
 }
+// G15 (16/11): contexto culpado do CCS (Preview/Vision): o reset pula o pedido que travou, mas o app manda o proximo e o
+// CCS trava de novo (16/11 18:11: ctx 0x19e, 4 resets seguidos, reboot). Como o i915 (contexto banido), quem estava no CCS
+// num reset entra na lista; cada envio dele ao CCS vira so a escrita do stamp (mesma sequencia do processGPUReset da Apple:
+// beginReset, resetRing, resubmitStampToRing, updateRingTail, forca restauracao, endReset). O app recebe os pedidos como
+// concluidos sem resultado. Lista por ponteiro+id (contexto liberado nao herda). Log G15-ccsban / G15-ccsskip.
+static struct {void *ctx;uint32_t id;void *task;uint64_t t;} g15CcsBan[8];static uint32_t g15CcsBanN=0;static volatile uint32_t g15CcsSkipN=0;
+static uint8_t *g15CcsItemCtx(uint8_t *st,unsigned list,unsigned j) {
+ auto item=*reinterpret_cast<uint8_t **>(st+0x30+(list&1)*16+j*8);return item?*reinterpret_cast<uint8_t **>(item):nullptr;
+}
+static bool g15CcsBanned(uint8_t *c) {
+ if(!c)return false;const uint32_t id=*reinterpret_cast<uint32_t *>(c+0x7C);
+ auto task=*reinterpret_cast<void **>(c+0x58);       // IGAccelTask do contexto (um por processo)
+ for(unsigned i=0;i<arrsize(g15CcsBan);++i) {
+  if(g15CcsBan[i].ctx==c && g15CcsBan[i].id==id)return true;
+  // 16/11 19:32: o Preview cria contextos novos e trava de novo (0x12e, depois 0x13a 9 s depois): o banimento vale para
+  // todos os contextos da mesma tarefa por 2 min depois do hang (a tarefa liberada pode ter o endereco reaproveitado)
+  if(task && g15CcsBan[i].task==task && g15CcsBan[i].t && g15Since(g15CcsBan[i].t)<120000000ULL)return true;
+ }
+ return false;
+}
+static void g15CcsBanFromReset(void *streamer) {
+ auto st=static_cast<uint8_t *>(streamer);
+ if(g15CcsResetOff || !g15RingStamp || streamer!=tglCSBEngines[1].streamer)return;
+ auto c=g15CcsItemCtx(st,*reinterpret_cast<uint32_t *>(st+0x50),0);
+ if(!c || g15CcsBanned(c))return;
+ const uint32_t id=*reinterpret_cast<uint32_t *>(c+0x7C);
+ // so o culpado de verdade: no reset que a Apple faz do proprio CCS (veredito dela) ou, no nosso (reset do RCS), se o CCS
+ // estava sem evento de CSB ha mais de 2 s ANTES do GDRST (o reset gera eventos em todos os motores; g15CcsQuietMs)
+ uint32_t quiet=g15CcsQuietMs;
+ if(g15CcsQuietCheckT && g15Since(g15CcsQuietCheckT)<15000000ULL && g15CcsQuietCheckMs>quiet)quiet=g15CcsQuietCheckMs;
+ if(g15CcsOurs && quiet<2000){g15Logf("G15-ccsban ctx=%x ignorado: CCS ativo ha %u ms antes do reset\n",id,quiet);return;}
+ g15CcsBan[g15CcsBanN%arrsize(g15CcsBan)]={c,id,*reinterpret_cast<void **>(c+0x58),mach_absolute_time()};++g15CcsBanN;
+ g15Logf("G15-ccsban #%u ctx=%x quieto=%ums\n",g15CcsBanN,id,quiet);
+}
+// 16/11 20:30 (PRM TGL Vol14, "Multicontext preemption tests hang with sampler, sc & hdc not done": Disable GSYNC).
+// GSYNC = 0xB0A0 bit 2 (kern_tgl_gsync.hpp). So com -wex-g15-gsync: aplicado no 1o envio depois do boot (com forcewake);
+// a copia do g15WrapResetEngine o devolve depois de um reset.
+static volatile uint32_t g15GsyncDone=0;
+static void g15GsyncApply(void *streamer) {
+ if(!g15GsyncOn || g15GsyncDone || !streamer || streamer!=tglCSBEngines[0].streamer)return;
+ if(!__sync_bool_compare_and_swap(&g15GsyncDone,0,1))return;
+ TGLCSBIO io(streamer,0);io.acquire();
+ auto reg=reinterpret_cast<volatile uint32_t *>(io.bar+0xB0A0);const uint32_t v=*reg;uint32_t after=v;
+ if(!(v&0xFF800001U) && !(v&4)){*reg=v|4;after=*reg;}
+ g15Logf("G15-gsync B0A0 %x->%x\n",v,after);
+ g15GsyncN=after; // sem setProperty: o envio pode rodar em contexto de interrupcao (aloca e pode bloquear)
+}
+static void g15BanSkip(void *streamer,uint32_t flags) {
+ auto st=static_cast<uint8_t *>(streamer);
+ if(!g15CcsBanN || !g15RingStamp || streamer!=tglCSBEngines[1].streamer)return;
+ const uint32_t act=*reinterpret_cast<uint32_t *>(st+0x50)&1;const unsigned next=1-act;
+ for(unsigned j=0;j<2;++j) {
+  auto item=*reinterpret_cast<uint8_t **>(st+0x30+next*16+j*8);auto c=item?*reinterpret_cast<uint8_t **>(item):nullptr;
+  if(!g15CcsBanned(c))continue;
+  // fora do reset (flags 0x80), so com o contexto fora da lista em execucao: anel de quem roda nao se mexe
+  // reenvio do reset (flags 0x80): o processGPUReset da Apple acabou de pular o pedido culpado; nada a fazer
+  if(flags&0x80)continue;
+  if(g15CcsItemCtx(st,act,0)==c || g15CcsItemCtx(st,act,1)==c)continue;
+  auto sh=*reinterpret_cast<uint8_t **>(c+0xB8);auto ring=sh?*reinterpret_cast<uint8_t **>(sh+0x130):nullptr;
+  if(!ring || ring[0x40]!=1)continue;
+  uint32_t tail=0;
+  reinterpret_cast<void (*)(void *)>(g15CtxBeginReset)(c);
+  reinterpret_cast<void (*)(void *)>(g15RingReset)(ring);
+  reinterpret_cast<void (*)(void *,uint32_t,uint32_t *)>(g15RingStamp)(ring,*reinterpret_cast<uint32_t *>(item+0x18),&tail);
+  reinterpret_cast<void (*)(void *,uint32_t)>(g15CtxUpdateTail)(c,tail);
+  c[0xC9]=1;
+  reinterpret_cast<void (*)(void *)>(g15CtxEndReset)(c);
+  const uint32_t n=__sync_add_and_fetch(&g15CcsSkipN,1);
+  if(n<=16 || !(n&63))g15Logf("G15-ccsskip #%u ctx=%x stamp=%x flags=%x\n",n,*reinterpret_cast<uint32_t *>(c+0x7C),*reinterpret_cast<uint32_t *>(item+0x18),flags);
+ }
+}
+// G15 (16/11 20:40): o processGPUReset da Apple marca com 0x8 (entrada +0x1C) os pedidos do contexto culpado ainda na fila
+// (nao enviados) e o evalWorkQueues pula essas entradas: nunca vao ao anel nem sao retirados, o IOAccel segue esperando os
+// stamps e o checkForProgress acusa hang com o CCS ocioso (20:20, 2o ciclo). Para contexto banido: tira o 0x8 e chuta o
+// despacho; no envio, o g15BanSkip transforma cada um em so o stamp, e eles sao concluidos (o app recebe sem resultado).
+// Fila do anel: *(streamer+0x20)+0xAA0+anel[0x38]*8; entradas de 32 bytes de [0x4000] (retirada) a [0x4048] (fim), mod 512;
+// entrada+0 = contexto, +0x1C = flags (como no processGPUReset/evalWorkQueues da Apple).
+static void g15CcsUnblockBanned(void *streamer) {
+ auto st=static_cast<uint8_t *>(streamer);
+ if(!g15CcsBanN || !g15RingStamp || streamer!=tglCSBEngines[1].streamer)return;
+ auto owner=*reinterpret_cast<uint8_t **>(st+0x20);if(!owner)return;
+ unsigned freed=0,scanned=0;
+ for(unsigned b=0;b<arrsize(g15CcsBan);++b) {
+  auto c=static_cast<uint8_t *>(g15CcsBan[b].ctx);if(!c || !g15CcsBanned(c))continue;
+  auto sh=*reinterpret_cast<uint8_t **>(c+0xB8);auto ring=sh?*reinterpret_cast<uint8_t **>(sh+0x130):nullptr;
+  if(!ring || ring[0x40]!=1)continue;
+  const int idx=*reinterpret_cast<int32_t *>(ring+0x38);if(idx<0 || idx>63)continue;
+  auto q=*reinterpret_cast<uint8_t **>(owner+0xAA0+idx*8);if(!q)continue;
+  uint64_t i=*reinterpret_cast<uint64_t *>(q+0x4000)&0x1FF;const uint64_t end=*reinterpret_cast<uint64_t *>(q+0x4048)&0x1FF;
+  for(unsigned n=0;i!=end && n<512;++n,i=(i+1)&0x1FF) {
+   auto e=q+i*32;++scanned;
+   auto ec=*reinterpret_cast<uint8_t **>(e);auto fl=reinterpret_cast<uint32_t *>(e+0x1C);
+   if(ec && g15CcsBanned(ec) && (*fl&8)){*fl&=~8U;++freed;}
+  }
+ }
+ if(freed || scanned)g15Logf("G15-ccsunblock liberados=%u vistos=%u\n",freed,scanned);
+ if(freed)g15KickAll();
+}
 void XE::wrapTGLCSBReset(void *streamer) {
+ g15CcsBanFromReset(streamer);
  g15LogResetState(streamer);g15LogHist("reset",g15ResetLogN);if(g15ResetLogN<=24)g15LogFlush();
  tglCSBInitialize(streamer);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
+ g15CcsUnblockBanned(streamer);
+}
+// G15 (16/11): hang do CCS (Preview/Vision: GPGPU_WALKER que nao termina). O detector da Apple culpa o RCS; o
+// resetGraphicsEngine do RCS escreve o GDRST, que zera tambem o CCS (modo 0, ACTHD 0: dominio de reset compartilhado), mas so
+// o motor culpado passa pelo resto do reset da Apple: salvar os registradores do anel (tabela em anel+0x78) antes do GDRST,
+// restaura-los depois e o processGPUReset do streamer (que pula o pedido culpado com resubmitStampToRing e reenvia o resto).
+// O CCS ficava sem isso: o contexto culpado era reenviado e travava de novo a cada reset, ate o watchdog do WindowServer.
+// Aqui, com o RCS sendo resetado e o CCS com trabalho, fazemos no CCS os mesmos tres passos com o codigo e as tabelas da
+// Apple, so se o GDRST de fato zerou o CCS (modo 0 depois). Registro G15CcsReset = {gancho, vezes}; log G15-ccsreset.
+static void g15SaveResetRegs(uint8_t *ring) {
+ auto tab=*reinterpret_cast<uint8_t **>(ring+0x78);auto base=*reinterpret_cast<volatile uint8_t **>(ring+0x50);
+ if(!tab || !base)return;const uint64_t n=*reinterpret_cast<uint64_t *>(tab);auto e=*reinterpret_cast<uint8_t **>(tab+0x10);
+ for(uint64_t i=0;e && i<n && i<256;++i,e+=0x24)
+  *reinterpret_cast<uint32_t *>(e+4)=*reinterpret_cast<volatile uint32_t *>(base+*reinterpret_cast<uint32_t *>(e));
+}
+static uint32_t g15RestoreResetRegs(uint8_t *ring) {
+ auto tab=*reinterpret_cast<uint8_t **>(ring+0x78);auto base=*reinterpret_cast<volatile uint8_t **>(ring+0x50);
+ auto accel=*reinterpret_cast<void **>(ring+0x10);
+ if(!tab || !base || !accel)return 0;const uint64_t n=*reinterpret_cast<uint64_t *>(tab);auto e=*reinterpret_cast<uint8_t **>(tab+0x10);
+ uint32_t k=0;
+ for(uint64_t i=0;e && i<n && i<256;++i,e+=0x24,++k) {
+  const uint32_t reg=*reinterpret_cast<uint32_t *>(e);uint32_t v=*reinterpret_cast<uint32_t *>(e+4);
+  const uint32_t d=reinterpret_cast<uint32_t (*)(void *,uint32_t)>(g15GetDefaultReset)(accel,reg);if(d)v=d;
+  if(e[8])v|=0xFFFF0000U;
+  *reinterpret_cast<volatile uint32_t *>(base+reg)=v;
+ }
+ return k;
+}
+static bool g15WrapResetEngine(void *ring,void *ctx) {
+ if(!g15CcsSwReset) {
+  // 16/11 19:30: RCS e CCS dividem o dominio de reset (GDRST render). O reset de um zera os registradores do outro
+  // (HWS_PGA, modo, ...), mais o RCU_MODE e as listas FORCE_TO_NONPRIV, e a Apple so trata o motor que culpou: o outro fica
+  // morto ate o proprio reset dele, que salva e restaura os zeros (cascata ate o watchdog). Como o i915 faz com dominio
+  // compartilhado: copia dos registradores de anel dos dois enquanto saudaveis; depois do reset de um, o outro recebe a
+  // copia de volta e passa pelo processGPUReset da Apple (pula o pedido em curso e reenvia o resto). Logs G15-rcufix,
+  // G15-pair, G15-ccsprep.
+  auto r0=static_cast<uint8_t *>(ring);const unsigned eng=r0?r0[0x40]:99;
+  if(eng>1)return reinterpret_cast<bool (*)(void *,void *)>(g15OrgResetEngine)(ring,ctx);
+  auto rst=static_cast<uint8_t *>(tglCSBEngines[0].streamer);
+  if(!rst)return reinterpret_cast<bool (*)(void *,void *)>(g15OrgResetEngine)(ring,ctx);
+  TGLCSBIO io(rst,0);io.acquire();
+  auto rd=[&](uint32_t g){return *reinterpret_cast<volatile uint32_t *>(io.bar+g);};
+  auto wr=[&](uint32_t g,uint32_t v){*reinterpret_cast<volatile uint32_t *>(io.bar+g)=v;};
+  uint32_t hwsReg[2]={0,0};
+  for(unsigned e=0;e<2;++e) {
+   auto st=static_cast<uint8_t *>(tglCSBEngines[e].streamer);if(!st || !tglCSBEngines[e].hardwareReady)continue;
+   TGLCSBIO x(st,0);hwsReg[e]=x.pointerReg-0x3A0+0x80;
+   // anel do motor: o que esta sendo resetado, ou o de um contexto nas listas, ou o ultimo conhecido
+   uint8_t *cr=(e==eng)?r0:nullptr;
+   for(unsigned l=0;l<2 && !cr;++l)for(unsigned k=0;k<2 && !cr;++k) {
+    auto c=g15CcsItemCtx(st,l,k);auto sh=c?*reinterpret_cast<uint8_t **>(c+0xB8):nullptr;
+    auto y=sh?*reinterpret_cast<uint8_t **>(sh+0x130):nullptr;if(y && y[0x40]==e)cr=y;
+   }
+   if(!cr)cr=g15PairSnap[e].ring;if(!cr)continue;g15PairSnap[e].ring=cr;
+   auto tab=*reinterpret_cast<uint8_t **>(cr+0x78);
+   if(tab && rd(hwsReg[e])) {        // saudavel: copia
+    const uint64_t n=*reinterpret_cast<uint64_t *>(tab);auto t=*reinterpret_cast<uint8_t **>(tab+0x10);unsigned m=0;
+    for(uint64_t q=0;t && q<n && m<16;++q,t+=0x24){const uint32_t reg=*reinterpret_cast<uint32_t *>(t);
+     g15PairSnap[e].reg[m]=reg;g15PairSnap[e].val[m]=rd(reg);g15PairSnap[e].masked[m]=t[8]!=0;++m;}
+    g15PairSnap[e].n=m;
+   } else if(e==eng && g15PairSnap[e].n && !rd(hwsReg[e])) {   // a Apple vai salvar zeros: devolve a copia antes
+    for(unsigned q=0;q<g15PairSnap[e].n;++q)wr(g15PairSnap[e].reg[q],g15PairSnap[e].val[q]|(g15PairSnap[e].masked[q]?0xFFFF0000U:0));
+    const uint32_t n=__sync_add_and_fetch(&g15CcsResetN,1);
+    if(n<=16)g15Logf("G15-ccsprep #%u e=%u regs=%u hws=%x\n",n,e,g15PairSnap[e].n,rd(hwsReg[e]));
+   }
+  }
+  if(rd(0x24D8)==0xB134) {
+   g15RcuSnap[0]=rd(0x14800);for(unsigned q=0;q<12;++q){g15RcuSnap[1+q]=rd(0x24D0+q*4);g15RcuSnap[13+q]=rd(0x1A4D0+q*4);}
+   // 16/11 20:30 (PRM TGL Vol14): FFDOP (0x20EC, mascarado; o WEX desliga o clock gating na partida: "AMFS Evaluate via
+   // Compute CS hangs if FFDOP clk gating is enabled"), GSYNC (0xB0A0) e LNCF MOCS 0xB020..0xB09C ("LNCF MOCS settings are
+   // cleared on soft reset of RCS/POCS/CCS ... the driver needs to reprogram LNCFCMOCS0 to LNCFCMOCS31")
+   g15RcuSnap2[0]=rd(0x20EC);g15RcuSnap2[1]=rd(0xB0A0);for(unsigned q=0;q<32;++q)g15RcuSnap2[2+q]=rd(0xB020+q*4);
+   g15RcuSnapOk=true;
+  }
+  if(eng==0 || eng==1) { // silencio do CCS antes do GDRST (para o banimento no par)
+   const uint64_t q=g15LastCSBT[1]?g15Since(g15LastCSBT[1])/1000:UINT32_MAX;g15CcsQuietMs=q>UINT32_MAX?UINT32_MAX:static_cast<uint32_t>(q);
+  }
+  const bool done=reinterpret_cast<bool (*)(void *,void *)>(g15OrgResetEngine)(ring,ctx);
+  if(!done)return done;
+  if(g15RcuSnapOk) {
+   const uint32_t rcu0=rd(0x14800),np0=rd(0x24D8),cnp0=rd(0x1A4D0);
+   if((rcu0&1)!=(g15RcuSnap[0]&1))wr(0x14800,0x10000U|(g15RcuSnap[0]&1));
+   for(unsigned q=0;q<12;++q){if(rd(0x24D0+q*4)!=g15RcuSnap[1+q])wr(0x24D0+q*4,g15RcuSnap[1+q]);
+    if(rd(0x1A4D0+q*4)!=g15RcuSnap[13+q])wr(0x1A4D0+q*4,g15RcuSnap[13+q]);}
+   const uint32_t ff0=rd(0x20EC),gs0=rd(0xB0A0);unsigned mocs=0;
+   if((ff0&0xFFFF)!=(g15RcuSnap2[0]&0xFFFF))wr(0x20EC,0xFFFF0000U|(g15RcuSnap2[0]&0xFFFF));
+   if(!(gs0&0xFF800001U) && gs0!=g15RcuSnap2[1])wr(0xB0A0,g15RcuSnap2[1]);
+   for(unsigned q=0;q<32;++q)if(rd(0xB020+q*4)!=g15RcuSnap2[2+q]){wr(0xB020+q*4,g15RcuSnap2[2+q]);++mocs;}
+   g15Logf("G15-rcufix2 e=%u ffdop=%x->%x gsync=%x->%x mocs=%u\n",eng,ff0,rd(0x20EC),gs0,rd(0xB0A0),mocs);
+   const uint32_t n=__sync_add_and_fetch(&g15RcuFixN,1);
+   if(n<=16)g15Logf("G15-rcufix #%u e=%u rcu=%x->%x np24d8=%x->%x np1a4d0=%x->%x\n",n,eng,rcu0,rd(0x14800),np0,rd(0x24D8),cnp0,rd(0x1A4D0));
+  }
+  // o outro motor do dominio: se ficou zerado, recebe a copia e o processGPUReset da Apple
+  const unsigned o=1-eng;auto ost=static_cast<uint8_t *>(tglCSBEngines[o].streamer);
+  if(ost && tglCSBEngines[o].hardwareReady && hwsReg[o] && !rd(hwsReg[o]) && g15PairSnap[o].n) {
+   for(unsigned q=0;q<g15PairSnap[o].n;++q)wr(g15PairSnap[o].reg[q],g15PairSnap[o].val[q]|(g15PairSnap[o].masked[q]?0xFFFF0000U:0));
+   const bool work=g15CcsItemCtx(ost,*reinterpret_cast<uint32_t *>(ost+0x50),0)!=nullptr;
+   const uint32_t n=__sync_add_and_fetch(&g15CcsResetN,1);
+   if(n<=16)g15Logf("G15-pair #%u reset=%u outro=%u regs=%u hws=%x trabalho=%u quieto=%ums\n",n,eng,o,g15PairSnap[o].n,rd(hwsReg[o]),work,g15CcsQuietMs);
+   if(work) {
+    g15CcsOurs=true;
+    reinterpret_cast<void (*)(void *)>(g15StreamerReset)(ost); // = wrapTGLCSBReset (rota) -> processGPUReset da Apple
+    g15CcsOurs=false;
+   }
+  }
+  return done;
+ }
+ auto r=static_cast<uint8_t *>(ring);
+ uint8_t *ccsRing=nullptr,*ccsCtx=nullptr;void *ccsStreamer=nullptr;uint32_t ccsBase=0;
+ if(r && r[0x40]==0) {
+  auto &eng=tglCSBEngines[1];auto st=static_cast<uint8_t *>(eng.streamer);
+  if(st && eng.hardwareReady) {
+   const uint32_t act=*reinterpret_cast<uint32_t *>(st+0x50)&1;
+   auto item=*reinterpret_cast<uint8_t **>(st+0x30+act*16);
+   auto c=item?*reinterpret_cast<uint8_t **>(item):nullptr;
+   auto sh=c?*reinterpret_cast<uint8_t **>(c+0xB8):nullptr;
+   auto cr=sh?*reinterpret_cast<uint8_t **>(sh+0x130):nullptr;
+   if(cr && cr!=r && cr[0x40]==1 && *reinterpret_cast<void **>(cr+0x10)==*reinterpret_cast<void **>(r+0x10)) {
+    TGLCSBIO io(st,0);ccsBase=io.pointerReg-0x3A0;ccsRing=cr;ccsCtx=c;ccsStreamer=st;
+   }
+  }
+ }
+ if(ccsRing) {
+  TGLCSBIO io(ccsStreamer,0);io.acquire();g15SaveResetRegs(ccsRing);
+  const uint64_t q=g15LastCSBT[1]?g15Since(g15LastCSBT[1])/1000:UINT32_MAX;g15CcsQuietMs=q>UINT32_MAX?UINT32_MAX:static_cast<uint32_t>(q);
+ }
+ const bool done=reinterpret_cast<bool (*)(void *,void *)>(g15OrgResetEngine)(ring,ctx);
+ if(!done || !ccsRing)return done;
+ TGLCSBIO io(ccsStreamer,0);io.acquire();
+ const uint32_t mode=*reinterpret_cast<volatile uint32_t *>(io.bar+ccsBase+0x29C);
+ const uint32_t n=__sync_add_and_fetch(&g15CcsResetN,1);
+ const uint32_t id=*reinterpret_cast<uint32_t *>(ccsCtx+0x7C);
+ if(mode) {
+  g15Logf("G15-ccsreset #%u ctx=%x modo=%x: CCS nao foi zerado, nada feito\n",n,id,mode);g15LogFlush();return done;
+ }
+ const uint32_t k=g15RestoreResetRegs(ccsRing);
+ g15Logf("G15-ccsreset #%u ctx=%x regs=%u quieto=%ums modo=%x\n",n,id,k,g15CcsQuietMs,*reinterpret_cast<volatile uint32_t *>(io.bar+ccsBase+0x29C));
+ g15CcsOurs=true;
+ reinterpret_cast<void (*)(void *)>(g15StreamerReset)(ccsStreamer); // = wrapTGLCSBReset (rota) -> processGPUReset da Apple
+ g15CcsOurs=false;
+ uint32_t rv[4]={1,n,g15CcsBanN,g15CcsSkipN};IORegistryEntry::getRegistryRoot()->setProperty("G15CcsReset",rv,sizeof(rv));
+ return done;
 }
 void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
  g15CSBSinceSleep++;g15CSBSinceReset++;g15CSBTotal++;
@@ -17164,6 +17558,8 @@ static bool tglRPCSPowerSerialize(void *,void *,OSSerialize *serializer) {
 }
 
 void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
+ if (tglCSB12Enabled) g15BanSkip(streamer,flags); // G15 (16/11): contexto banido do CCS vira so o stamp
+ if (tglCSB12Enabled) g15GsyncApply(streamer);
  if (callbackXE->adlnDetected) {
   auto owner=*reinterpret_cast<void **>(static_cast<uint8_t *>(streamer)+0x10);
   if (!adlnNativeIRQPrerequisites(owner,true))
@@ -20698,6 +21094,9 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
 		tx.value = value; tx.pending = true;
 		return; // record the actual write later, immediately before power teardown
 	}
+	// ADL-S plane 1A coherence; outside an active window this costs one bool read.
+	if (__builtin_expect(adlsPlaneFilterActive, 0) && (reg == 0x70180 || reg == 0x70188 || reg == 0x7019C))
+		value = adlsPlaneCoherenceWrite(access, reg, value, false, __builtin_return_address(0));
 	// Linux icl_aux_power_well_enable/disable uses this PHY override only on
 	// ICL. Preserve native TGL AUX request, ACK polling and reference counts.
 	if (callbackXE->tglActive && callbackXE->tglComboAUXGateReady &&
@@ -20763,6 +21162,8 @@ void XE::wrapTGLFastRegisterWrite(void *access, unsigned long reg, uint32_t valu
 	g15DcTouch(reg); // G15: DC por software
 	g15PcRead = reinterpret_cast<G15RegRd>(callbackXE->orgTGLRegisterRead);
 	value = g15PcFilter(access, reg, value, reinterpret_cast<G15RegWr>(callbackXE->orgTGLFastRegisterWrite)); // G15 #131 passo 1
+	if (__builtin_expect(adlsPlaneFilterActive, 0) && (reg == 0x70180 || reg == 0x70188 || reg == 0x7019C))
+		value = adlsPlaneCoherenceWrite(access, reg, value, true, __builtin_return_address(0)); // #131 passo 1 (gupaixao)
 	tglProgramRecord(access, reg, value, 1, __builtin_return_address(0));
 	tglStreamAck(access, reg, value, 1, __builtin_return_address(0));
 	auto irq=reg==0x190010 ? tglFBIRQBegin(0,callbackXE->tglObservationController,value,
@@ -20852,8 +21253,81 @@ void XE::wrapTGLPlaneUpdate(void *plane, bool flag) {
 void XE::wrapTGLPlaneSetup(void *plane, void *path) {
 	auto fb = *reinterpret_cast<void **>(static_cast<uint8_t *>(plane) + 0x68);
 	tglObserveScanout(fb, plane, 4, false, 0);
+	adlsPlaneCoherenceSetup(plane, fb, false);
 	FunctionCast(wrapTGLPlaneSetup, callbackXE->orgTGLPlaneSetup)(plane, path);
+	adlsPlaneCoherenceSetup(plane, fb, true);
 	tglObserveScanout(fb, plane, 4, true, 0);
+}
+
+// ADL-S plane 1A coherence (kern_adls_plane_coherence.hpp). Three points:
+//  - wrapTGLPlaneSetup: PLANE_CTL/STRIDE/SURF shadows (plane+0x100/+0x118/+0x120) before and after the donor's
+//    setupPlane, then the decision (which runs before enablePlane and programPipeScaler in hwSetMode);
+//  - wrapTGLRegisterWrite/wrapTGLFastRegisterWrite: only while a window is active (one bool read otherwise),
+//    PLANE_CTL/STRIDE/SURF of plane 1A on the controller's access manager are filtered.
+// The lock is held only around the pure decision; the coherent pair is written after it is released, through the
+// original writer, before SURF. No allocation on the write path.
+bool XE::adlsPlaneIsPrimaryA(void *plane, void *fb) {
+	if (!plane || !fb || !callbackXE->adlsDisplaySelected || !callbackXE->tglObservationController) return false;
+	auto p = static_cast<uint8_t *>(plane);
+	return *reinterpret_cast<void **>(static_cast<uint8_t *>(fb) + 0x1D0) == callbackXE->tglObservationController &&
+		*reinterpret_cast<uint32_t *>(p + 0x78) == 0 && *reinterpret_cast<uint32_t *>(p + 0x98) == 0x70180 &&
+		*reinterpret_cast<uint32_t *>(p + 0xB8) == 0x7019C;
+}
+void XE::adlsPlaneCoherenceSetup(void *plane, void *fb, bool done) {
+	using namespace ADLSPlaneCoherence;
+	if (!adlsPlaneCoherenceEnabled || !adlsPlaneLock || !adlsPlaneIsPrimaryA(plane, fb)) return;
+	auto p = static_cast<uint8_t *>(plane);
+	const Shadow sh {*reinterpret_cast<uint32_t *>(p + 0x100), *reinterpret_cast<uint32_t *>(p + 0x118),
+		*reinterpret_cast<uint32_t *>(p + 0x120)};
+	if (!done) {
+		const auto irq = IOSimpleLockLockDisableInterrupt(adlsPlaneLock);
+		auto &q = adlsPlanePending;
+		q.plane = plane; q.thread = current_thread(); q.pre = sh; q.valid = false;
+		IOSimpleLockUnlockEnableInterrupt(adlsPlaneLock, irq);
+		return;
+	}
+	// Hardware right after setupPlane (before enablePlane): enabled access manager, MMIO window covering
+	// PLANE_SURFLIVE, framebuffer online and PW1 on; ~0u stays as read.
+	Hardware h {};
+	auto ctl = static_cast<uint8_t *>(callbackXE->tglObservationController);
+	auto access = *reinterpret_cast<void **>(p + 0x90);
+	if (callbackXE->orgTGLRegisterRead && access && *reinterpret_cast<void **>(ctl + 0xC40) == access &&
+		*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(access) + 0x60) > PlaneSurfLive &&
+		*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(fb) + 0x4210)) {
+		const auto read = FunctionCast(wrapTGLRegisterRead, callbackXE->orgTGLRegisterRead);
+		const auto power = read(access, 0x45404);
+		if (power != ~0U && (power & 1)) {
+			h.read = true; h.ctl = read(access, PlaneCtl); h.stride = read(access, PlaneStride);
+			h.surf = read(access, PlaneSurf); h.size = read(access, PlaneSize);
+		}
+	}
+	const uint32_t fb4330 = *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(fb) + 0x4330);
+	const auto irq = IOSimpleLockLockDisableInterrupt(adlsPlaneLock);
+	auto &q = adlsPlanePending;
+	if (q.plane == plane && q.thread == current_thread()) {
+		q.post = sh; q.valid = true;
+		decide(adlsPlaneState, q.pre, q.post, fb4330, h, adlsBootVideo);
+		q.valid = false;
+		adlsPlaneFilterActive = active(adlsPlaneState);
+	}
+	IOSimpleLockUnlockEnableInterrupt(adlsPlaneLock, irq);
+}
+// MMIO boundary (only with adlsPlaneFilterActive). Returns the value to write; writes the coherent pair first
+// when the first own SURF of the boot arrives (SURF last, a single arm).
+uint32_t XE::adlsPlaneCoherenceWrite(void *access, unsigned long reg, uint32_t value, bool fast, void *caller) {
+	using namespace ADLSPlaneCoherence;
+	auto ctl = static_cast<uint8_t *>(callbackXE->tglObservationController);
+	if (!adlsPlaneLock || !ctl || !access || *reinterpret_cast<void **>(ctl + 0xC40) != access) return value;
+	const auto irq = IOSimpleLockLockDisableInterrupt(adlsPlaneLock);
+	const auto w = filter(adlsPlaneState, static_cast<uint32_t>(reg), value);
+	adlsPlaneFilterActive = active(adlsPlaneState);
+	IOSimpleLockUnlockEnableInterrupt(adlsPlaneLock, irq);
+	for (uint32_t i = 0; i < w.count; ++i) {
+		tglProgramRecord(access, w.reg[i], w.data[i], uint32_t(fast) | 0x10, caller);
+		if (fast) FunctionCast(wrapTGLFastRegisterWrite, callbackXE->orgTGLFastRegisterWrite)(access, w.reg[i], w.data[i]);
+		else FunctionCast(wrapTGLRegisterWrite, callbackXE->orgTGLRegisterWrite)(access, w.reg[i], w.data[i]);
+	}
+	return w.value;
 }
 
 // Capture the native input without rewriting color/clock contracts. The first
