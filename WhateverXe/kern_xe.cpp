@@ -432,6 +432,16 @@ static bool tglAlderLakeNGoldenRestore(void *context);
 static void adlnCaptureOwnedGolden(void *context);
 uint32_t tglCPSCounts[17] {}; // attempts, failures, GGTT, pointer, RCS, samples,
                            // bit set/unset, last7304, last21C0, ptr match/mismatch
+// G15 (21/11): workarounds de contexto no batch acima. g15CtxWaStat = {pares no LRI, amostras com o ponteiro do batch no
+// contexto residente, dessas com 0xE18C b15 ligado, ultimo 0xE18C, ultimo 0x7018, ultimo 0x7300, amostras sem o ponteiro}.
+static uint32_t g15CtxWaPairs;
+static uint32_t g15CtxWaStat[6];
+static bool g15CtxWaSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[7] {__atomic_load_n(&g15CtxWaPairs,__ATOMIC_RELAXED)};
+ for(unsigned i=0;i<6;++i)out[i+1]=__atomic_load_n(&g15CtxWaStat[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 static bool tglCPSPrepare(void *owner) {
  __atomic_fetch_add(&tglCPSCounts[0],1,__ATOMIC_RELAXED);
  auto fail=[](){__atomic_fetch_add(&tglCPSCounts[1],1,__ATOMIC_RELAXED);return false;};
@@ -466,8 +476,24 @@ static bool tglCPSPrepare(void *owner) {
  // complete TGL timer value after every context restore; no read/modify/write.
  // r160: Wa_1606931601, masked EU early-read disable. Existing multicast
  // steering is retained; this adds no CPU MMIO write or synchronization wait.
- const uint32_t batch[] {0,0x11000005,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x40004000,0x05000000};
- bzero(cpu,extent);memcpy(cpu,batch,sizeof(batch));
+ // G15 (21/11): workarounds de contexto do i915/xe (GRAPHICS 12.00 = TGL/RKL/ADL-S/RPL) no mesmo LRI. O SAMPLER_MODE e
+ // salvo na imagem de contexto (a escrita MMIO do g15GtWa se perdia), entao vai aqui, depois de cada restauracao:
+ //   GEN10_SAMPLER_MODE    0xE18C masked bit 15 (ENABLE_SMALLPL)                  Wa_1406941453
+ //   HIZ_CHICKEN           0x7018 masked bit 13 (HZ_DEPTH_TEST_LE_GE_OPT_DISABLE) Wa_1806527549
+ //   COMMON_SLICE_CHICKEN4 0x7300 masked bit 6  (DISABLE_TDC_LOAD_BALANCING_CALC) Wa_1606376872
+ // -wex-g15-ctxwa-off tira os 3; -wex-g15-ctxwa-e18c deixa so o 0xE18C. Leitura: "G15CtxWaLive" e linha G15-ctxwa do hang log.
+ uint32_t batch[16] {0,0,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x40004000};unsigned nb=8;
+ if(!checkKernelArgument("-wex-g15-ctxwa-off")) {
+  batch[nb++]=0xE18C;batch[nb++]=0x80008000;
+  if(!checkKernelArgument("-wex-g15-ctxwa-e18c")) {
+   batch[nb++]=0x7018;batch[nb++]=0x20002000;
+   batch[nb++]=0x7300;batch[nb++]=0x00400040;
+  }
+ }
+ batch[1]=0x11000000|(nb-3); // MI_LOAD_REGISTER_IMM: comprimento = 2*pares-1
+ batch[nb++]=0x05000000;     // MI_BATCH_BUFFER_END
+ __atomic_store_n(&g15CtxWaPairs,(nb-3)/2,__ATOMIC_RELAXED);
+ bzero(cpu,extent);memcpy(cpu,batch,nb*4);
  if(tglContextCacheEnabled)TGLContextCache::batch(cpu);
  // Publish CPU writes before first GPU use, independent of LLC policy.
  for(unsigned i=0;i<extent;i+=64)asm volatile("clflush (%0)"::"r"(cpu+i):"memory");
@@ -12735,6 +12761,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			if(auto live=OSSerializer::forTarget(nullptr,tglCPSSerialize)) {
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLCPSColorPipeLive",live);live->release();
 			}
+			if(auto live=OSSerializer::forTarget(nullptr,g15CtxWaSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("G15CtxWaLive",live);live->release();
+			}
 			if(auto live=OSSerializer::forTarget(nullptr,tglEarlyReadSerialize)) {
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLEarlyReadLive",live);live->release();
 			}
@@ -16401,6 +16430,10 @@ static void g15LogSched(const char *tag,uint32_t n,uint32_t cs) {
    rd(base+0x68),rd(base+0x5C),rd(base+0x74),rd(base+0x78),rd(base+0x168),rd(base+0x140),rd(base+0x110),rd(base+0x6C),
    rd(base+0x70),rd(base+0xB0),rd(base+0xB8),rd(base+0xB4),rd(base+0x9C),rd(base+0x3C),rd(base+0x38),rd(base+0x94),
    rd(base+0x80),rd(base+0x29C),rd(base+0x50),rd(base+0x244),rd(base+0x180));
+  // G15 (21/11): workarounds de contexto com o contexto residente (o do hang). bbptr = 0x21C0 (batch por contexto do WEX).
+  if(base==0x2000)g15Logf("G15-ctxwa %s #%u pares=%u bbptr=%x esperado=%x sampler=%x hiz=%x csc4=%x\n",tag,n,
+   __atomic_load_n(&g15CtxWaPairs,__ATOMIC_RELAXED),rd(0x21C0),__atomic_load_n(&tglCPSCounts[3],__ATOMIC_RELAXED),
+   rd(0xE18C),rd(0x7018),rd(0x7300));
   {
    char line[420];size_t used=0;line[0]=0;
    for(unsigned i=0;i<TGLCSB::Capacity && used<sizeof(line);++i)
@@ -17647,6 +17680,14 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
    __atomic_store_n(&tglCPSCounts[9],ptr,__ATOMIC_RELAXED);
    const auto expected=__atomic_load_n(&tglCPSCounts[3],__ATOMIC_RELAXED);
    __atomic_fetch_add(&tglCPSCounts[ptr==expected?10:11],1,__ATOMIC_RELAXED);
+   if(ptr==expected) {
+    const auto sm=*reinterpret_cast<volatile uint32_t *>(b+0xE18C);
+    __atomic_fetch_add(&g15CtxWaStat[0],1,__ATOMIC_RELAXED);
+    if(sm!=UINT32_MAX && (sm&0x8000))__atomic_fetch_add(&g15CtxWaStat[1],1,__ATOMIC_RELAXED);
+    __atomic_store_n(&g15CtxWaStat[2],sm,__ATOMIC_RELAXED);
+    __atomic_store_n(&g15CtxWaStat[3],*reinterpret_cast<volatile uint32_t *>(b+0x7018),__ATOMIC_RELAXED);
+    __atomic_store_n(&g15CtxWaStat[4],*reinterpret_cast<volatile uint32_t *>(b+0x7300),__ATOMIC_RELAXED);
+   } else __atomic_fetch_add(&g15CtxWaStat[5],1,__ATOMIC_RELAXED);
    __atomic_fetch_add(&tglCPSCounts[(v&0x200)?6:7],1,__ATOMIC_RELAXED);
    __atomic_fetch_add(&tglCPSCounts[5],1,__ATOMIC_RELAXED);
   }
