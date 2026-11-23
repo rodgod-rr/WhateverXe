@@ -3827,15 +3827,24 @@ __attribute__((noinline)) static void g15XtBoot() {
  g15XtFb=reinterpret_cast<uint8_t *>(g15XtMap->getVirtualAddress());
  g15XtStat[0]=1;g15XtPublish();
 }
+// Os registradores do plano tem buffer duplo e a leitura devolve o valor PENDENTE (1o boot do teste, 22/11: CTL lido ja em
+// X no SURF 0, motivo 4). A prova do console e feita na 1a escrita de CTL em X, ANTES de ela passar: CTL ligado e LINEAR,
+// SURF 0 e stride do console = o estado do firmware. A conversao vem depois, na 1a escrita de SURF 0.
+static uint32_t g15XtProof=0;                            // 1 = console provado, 2 = recusado
 static void g15XtFilter(void *access,unsigned long reg,uint32_t value) {
- if(!g15XtFb || g15XtDone)return;
- if(reg==0x70180){g15XtLastCtl=value;return;}
- if(reg!=0x7019C || value!=0 || (g15XtLastCtl&0x1C00U)!=0x400U || !(g15XtLastCtl&0x80000000U) || !g15PcRead)return;
+ if(!g15XtFb || g15XtDone || !g15PcRead)return;
+ if(reg==0x70180) {
+  g15XtLastCtl=value;
+  if(g15XtProof || (value&0x1C00U)!=0x400U || !(value&0x80000000U))return;
+  const uint32_t ctl=g15PcRead(access,0x70180),str=g15PcRead(access,0x70188),surf=g15PcRead(access,0x7019C);
+  g15XtStat[4]=ctl;g15XtStat[5]=surf;
+  g15XtProof=(ctl!=~0U && (ctl&0x80000000U) && !(ctl&0x1C00U) && surf==0 && (str&0x7FFU)*64==g15XtPitch)?1:2;
+  if(g15XtProof==2){g15XtDone=1;g15XtStat[3]=4;g15XtPublish();}
+  return;
+ }
+ if(reg!=0x7019C || value!=0 || g15XtProof!=1 || (g15XtLastCtl&0x1C00U)!=0x400U)return;
  g15XtDone=1;
- const uint32_t ctl=g15PcRead(access,0x70180),str=g15PcRead(access,0x70188),surf=g15PcRead(access,0x7019C);
- g15XtStat[4]=ctl;g15XtStat[5]=surf;
  if(g15UpMs()>120000){g15XtStat[3]=5;g15XtPublish();return;}
- if(ctl==~0U || !(ctl&0x80000000U) || (ctl&0x1C00U) || surf!=0 || (str&0x7FFU)*64!=g15XtPitch){g15XtStat[3]=4;g15XtPublish();return;}
  const uint64_t t0=mach_absolute_time();
  memcpy(g15XtTmp,g15XtFb,g15XtLen);                       // o console linear
  const uint32_t tilesX=g15XtPitch/512;
