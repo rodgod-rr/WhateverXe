@@ -3799,6 +3799,54 @@ static uint32_t g15PcFilter(void *access,unsigned long reg,uint32_t value,G15Reg
  if(g15PcStat[1]+g15PcStat[2]+g15PcStat[3]+g15PcStat[4]<=16)g15PcPublish();
  return value;
 }
+// G15 #131 (22/11, licao do i915 portado): em vez de brigar com o driver (plano linear forcado, recurso descrito linear -
+// 14/11, nada resolveu), a MEMORIA do console passa a bater com o que ele acredita. Na tomada do painel o driver arma o
+// plano 1 do pipe A em tiling X com SURF 0 (o console linear do GOP): lido como X = as macas listradas, e o WindowServer
+// copia o recurso do FB 0 (descrito X) para as superficies dele = macas alem do 1o quadro. Na 1a escrita de PLANE_SURF = 0
+// por MMIO depois de um PLANE_CTL com tiling X, com o hardware ainda mostrando o console (ligado, LINEAR, SURF 0, stride
+// do console), o console (1920x1080, 8 MB) e regravado no layout X do Gen12 (bloco 512 B x 8 linhas, sem swizzle) antes
+// da escrita passar: o plano e as copias leem a maca certa. Uma vez por boot, nos 2 primeiros minutos, modo grafico sem -v.
+// Mapa e copia temporaria preparados no boot (contexto seguro); no gancho so memcpy. -wex-g15-xtile-off desliga (e com
+// -wex-g15-131 fica desligado). Registro "G15ConsoleXTile" = {pronto, convertido, ms, motivo, CTL lido, SURF lido}:
+// motivo 1 desligado, 2 geometria, 3 sem memoria, 4 hardware nao mostra o console, 5 fora da janela.
+static uint8_t *g15XtFb=nullptr,*g15XtTmp=nullptr;static IOMemoryMap *g15XtMap=nullptr;static size_t g15XtLen=0;
+static uint32_t g15XtPitch=0,g15XtRows=0,g15XtStat[6]={},g15XtLastCtl=0;static volatile uint32_t g15XtDone=0;
+static void g15XtPublish(){IORegistryEntry::getRegistryRoot()->setProperty("G15ConsoleXTile",g15XtStat,sizeof(g15XtStat));}
+__attribute__((noinline)) static void g15XtBoot() {
+ const auto &v=PE_state.video;
+ if(checkKernelArgument("-wex-g15-xtile-off") || checkKernelArgument("-wex-g15-131") || checkKernelArgument("-v")){g15XtStat[3]=1;g15XtPublish();return;}
+ if(v.v_display!=1 || v.v_depth!=32 || !v.v_baseAddr || !v.v_rowBytes || (v.v_rowBytes&511) || !v.v_height || (v.v_height&7) ||
+    v.v_width*4>v.v_rowBytes){g15XtStat[3]=2;g15XtPublish();return;}
+ g15XtPitch=static_cast<uint32_t>(v.v_rowBytes);g15XtRows=static_cast<uint32_t>(v.v_height);g15XtLen=static_cast<size_t>(g15XtPitch)*g15XtRows;
+ IOMemoryDescriptor *md=IOMemoryDescriptor::withPhysicalAddress(static_cast<IOPhysicalAddress>(v.v_baseAddr),g15XtLen,kIODirectionInOut);
+ g15XtMap=md?md->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapWriteCombineCache):nullptr;
+ if(md)md->release();
+ g15XtTmp=static_cast<uint8_t *>(IOMalloc(g15XtLen));
+ if(!g15XtMap || !g15XtTmp){if(g15XtMap){g15XtMap->release();g15XtMap=nullptr;}if(g15XtTmp){IOFree(g15XtTmp,g15XtLen);g15XtTmp=nullptr;}
+  g15XtStat[3]=3;g15XtPublish();return;}
+ g15XtFb=reinterpret_cast<uint8_t *>(g15XtMap->getVirtualAddress());
+ g15XtStat[0]=1;g15XtPublish();
+}
+static void g15XtFilter(void *access,unsigned long reg,uint32_t value) {
+ if(!g15XtFb || g15XtDone)return;
+ if(reg==0x70180){g15XtLastCtl=value;return;}
+ if(reg!=0x7019C || value!=0 || (g15XtLastCtl&0x1C00U)!=0x400U || !(g15XtLastCtl&0x80000000U) || !g15PcRead)return;
+ g15XtDone=1;
+ const uint32_t ctl=g15PcRead(access,0x70180),str=g15PcRead(access,0x70188),surf=g15PcRead(access,0x7019C);
+ g15XtStat[4]=ctl;g15XtStat[5]=surf;
+ if(g15UpMs()>120000){g15XtStat[3]=5;g15XtPublish();return;}
+ if(ctl==~0U || !(ctl&0x80000000U) || (ctl&0x1C00U) || surf!=0 || (str&0x7FFU)*64!=g15XtPitch){g15XtStat[3]=4;g15XtPublish();return;}
+ const uint64_t t0=mach_absolute_time();
+ memcpy(g15XtTmp,g15XtFb,g15XtLen);                       // o console linear
+ const uint32_t tilesX=g15XtPitch/512;
+ for(uint32_t y=0;y<g15XtRows;++y) {                       // X do Gen12: blocos de 4 KB = 512 B x 8 linhas, em linhas de blocos
+  const uint8_t *src=g15XtTmp+static_cast<size_t>(y)*g15XtPitch;
+  uint8_t *row=g15XtFb+static_cast<size_t>(y>>3)*tilesX*4096+static_cast<size_t>(y&7)*512;
+  for(uint32_t tx=0;tx<tilesX;++tx)memcpy(row+static_cast<size_t>(tx)*4096,src+static_cast<size_t>(tx)*512,512);
+ }
+ uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-t0,&ns);
+ g15XtStat[1]=1;g15XtStat[2]=static_cast<uint32_t>(ns/1000000ULL);g15XtPublish();
+}
 // O 1o quadro do WindowServer (e todo flip) chega pela GPU so com o SURF: sem isto o plano seguia com o par linear e a
 // superficie X do WindowServer era lida como linear (logo repetido ~1 s). Antes de cada PerformFlipTransaction, com o par
 // linear no hardware, escreve o par do doador por MMIO: CTL/STRIDE sao armados so pelo proximo SURF (o do flip), entao o
@@ -14249,6 +14297,7 @@ bool XE::processKextFull(KernelPatcher &patcher, size_t index, mach_vm_address_t
      g15PsrBoot(patcher,index,address,size,orgTGLFastRegisterWrite!=0); // G15 PSR: so com o boot-arg wexg15psr
      g15MuxBoot(patcher,index,address,size); // G15 mux PS8461E: sysctl debug.g15edp_recover (recoverDPLink da Apple)
      g15PcBoot(patcher,index,address,size,orgTGLRegisterWrite); // G15 #131 passo 1: par do doador antes de cada flip
+     g15XtBoot(); // G15 #131 (22/11): console regravado no layout X na tomada do painel
      patcher.clearError();
      bool smReady=adlsPanelPowerFn && orgTGLRegisterRead;
      if(smReady) {
@@ -21230,6 +21279,7 @@ void XE::wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value) {
 	g15DcTouch(reg); // G15: DC por software
 	g15PcRead = reinterpret_cast<G15RegRd>(callbackXE->orgTGLRegisterRead);
 	value = g15PcFilter(access, reg, value, reinterpret_cast<G15RegWr>(callbackXE->orgTGLRegisterWrite)); // G15 #131 passo 1
+	g15XtFilter(access, reg, value); // G15 #131: console regravado em X antes do SURF 0 com o plano em X
 	// G15 PSR: sai antes de qualquer escrita que desligue pipe/DDI/DP_TP/painel ou mexa no CDCLK; mantem o PIPE_MISC[20].
 	if (g15PsrOn && (((reg == 0x70008 || reg == 0x64000 || reg == 0x60540) && !(value & 0x80000000U)) ||
 		(reg == 0xC7204 && !(value & 1)) || reg == 0x46000 || reg == 0x46070)) g15PsrSourceOff(4);
@@ -21358,6 +21408,7 @@ void XE::wrapTGLFastRegisterWrite(void *access, unsigned long reg, uint32_t valu
 	g15DcTouch(reg); // G15: DC por software
 	g15PcRead = reinterpret_cast<G15RegRd>(callbackXE->orgTGLRegisterRead);
 	value = g15PcFilter(access, reg, value, reinterpret_cast<G15RegWr>(callbackXE->orgTGLFastRegisterWrite)); // G15 #131 passo 1
+	g15XtFilter(access, reg, value); // G15 #131: console regravado em X antes do SURF 0 com o plano em X
 	if (__builtin_expect(adlsPlaneFilterActive, 0) && (reg == 0x70180 || reg == 0x70188 || reg == 0x7019C))
 		value = adlsPlaneCoherenceWrite(access, reg, value, true, __builtin_return_address(0)); // #131 passo 1 (gupaixao)
 	tglProgramRecord(access, reg, value, 1, __builtin_return_address(0));
