@@ -3807,10 +3807,10 @@ static uint32_t g15PcFilter(void *access,unsigned long reg,uint32_t value,G15Reg
 // do console), o console (1920x1080, 8 MB) e regravado no layout X do Gen12 (bloco 512 B x 8 linhas, sem swizzle) antes
 // da escrita passar: o plano e as copias leem a maca certa. Uma vez por boot, nos 2 primeiros minutos, modo grafico sem -v.
 // Mapa e copia temporaria preparados no boot (contexto seguro); no gancho so memcpy. -wex-g15-xtile-off desliga (e com
-// -wex-g15-131 fica desligado). Registro "G15ConsoleXTile" = {pronto, convertido, ms, motivo, CTL lido, SURF lido}:
+// -wex-g15-131 fica desligado). Registro "G15ConsoleXTile" = {pronto, convertido, ms, motivo, CTL lido, SURF lido, STRIDE lido}:
 // motivo 1 desligado, 2 geometria, 3 sem memoria, 4 hardware nao mostra o console, 5 fora da janela.
 static uint8_t *g15XtFb=nullptr,*g15XtTmp=nullptr;static IOMemoryMap *g15XtMap=nullptr;static size_t g15XtLen=0;
-static uint32_t g15XtPitch=0,g15XtRows=0,g15XtStat[6]={},g15XtLastCtl=0;static volatile uint32_t g15XtDone=0;
+static uint32_t g15XtPitch=0,g15XtRows=0,g15XtStat[7]={},g15XtLastCtl=0;static volatile uint32_t g15XtDone=0;
 static void g15XtPublish(){IORegistryEntry::getRegistryRoot()->setProperty("G15ConsoleXTile",g15XtStat,sizeof(g15XtStat));}
 __attribute__((noinline)) static void g15XtBoot() {
  const auto &v=PE_state.video;
@@ -3837,8 +3837,10 @@ static void g15XtFilter(void *access,unsigned long reg,uint32_t value) {
   g15XtLastCtl=value;
   if(g15XtProof || (value&0x1C00U)!=0x400U || !(value&0x80000000U))return;
   const uint32_t ctl=g15PcRead(access,0x70180),str=g15PcRead(access,0x70188),surf=g15PcRead(access,0x7019C);
-  g15XtStat[4]=ctl;g15XtStat[5]=surf;
-  g15XtProof=(ctl!=~0U && (ctl&0x80000000U) && !(ctl&0x1C00U) && surf==0 && (str&0x7FFU)*64==g15XtPitch)?1:2;
+  g15XtStat[4]=ctl;g15XtStat[5]=surf;g15XtStat[6]=str;
+  // 2o boot (22/11): STRIDE lido ja no valor pendente do X (escrito antes do CTL) = 15 (x 512 B); aceita as duas unidades
+  const uint32_t st=str&0x7FFU;
+  g15XtProof=(ctl!=~0U && (ctl&0x80000000U) && !(ctl&0x1C00U) && surf==0 && (st*64==g15XtPitch || st*512==g15XtPitch))?1:2;
   if(g15XtProof==2){g15XtDone=1;g15XtStat[3]=4;g15XtPublish();}
   return;
  }
